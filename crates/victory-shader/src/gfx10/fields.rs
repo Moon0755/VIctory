@@ -579,6 +579,8 @@ impl Instruction {
                                 chan: (code >> 6 & 3) as u8,
                                 high: code >> 8 & 1 == 1,
                             }
+                        } else if i == 1 && name == "v_interp_mov_f32" {
+                            Operand::Const(code as u8)
                         } else if i == 2 && carry_in {
                             source(code, lanes, w(2))
                         } else {
@@ -647,6 +649,9 @@ const VOP3_TWO_SOURCES: &[&str] = &[
     "v_cvt_pknorm_i16_f16",
     "v_cvt_pknorm_u16_f16",
     "v_lshlrev_b16",
+    "v_interp_p1_f32",
+    "v_interp_p2_f32",
+    "v_interp_mov_f32",
     "v_interp_p1ll_f16",
     "v_readlane_b32",
     "v_writelane_b32",
@@ -820,9 +825,12 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
-    } else {
-        whole + 2 * derivs + packed
+    // On RDNA2 the G16 opcode selects packed derivatives independently of A16.
+    if name.ends_with("_g16") {
+        derivs = derivs.div_ceil(2);
     }
+    if a16 {
+        packed = packed.div_ceil(2);
+    }
+    whole + 2 * derivs + packed
 }

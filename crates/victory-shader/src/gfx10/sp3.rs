@@ -96,6 +96,10 @@ fn join(ops: impl IntoIterator<Item = String>) -> String {
     ops.into_iter().collect::<Vec<_>>().join(", ")
 }
 
+fn interp_param(code: u8) -> &'static str {
+    ["p10", "p20", "p0"].get(usize::from(code)).unwrap_or(&"p?")
+}
+
 fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
     let mut out = String::new();
     match fields {
@@ -162,9 +166,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
         Fields::Valu(v) => out = valu(name, v, inst.encoding),
         Fields::Vintrp { dst, src, attr } => {
             let src = match (name, src) {
-                ("v_interp_mov_f32", Operand::Const(p)) => ["p10", "p20", "p0"]
-                    .get(usize::from(*p))
-                    .map_or("p?".into(), |p| p.to_string()),
+                ("v_interp_mov_f32", Operand::Const(p)) => interp_param(*p).into(),
                 _ => src.to_string(),
             };
             out = format!("{dst}, {src}, {attr}");
@@ -532,7 +534,10 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
     let mix = name.starts_with("v_fma_mix");
     let src = |i: usize| {
         let o = v.src[i];
-        let mut s = o.to_string();
+        let mut s = match (name, i, o) {
+            ("v_interp_mov_f32", 1, Operand::Const(p)) => interp_param(p).into(),
+            _ => o.to_string(),
+        };
         if let Some(sdwa) = v.sdwa
             && bit(sdwa.sext, i)
         {
@@ -960,15 +965,15 @@ mod tests {
                 "image_sample_cd_g16 v[0:3], [v0,v2,v4,v5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
             ),
             (
-                &[0xf1a4_0f0b, 0x0040_0000, 0x0006_0502],
+                &[0xf1a4_0f0b, 0x0040_0000, 0x0605_0402],
                 "image_sample_cd_cl_g16 v[0:3], [v0,v2,v4,v5,v6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
             ),
             (
-                &[0xf1a8_0f0b, 0x0040_0000, 0x0006_0501],
+                &[0xf1a8_0f0b, 0x0040_0000, 0x0605_0301],
                 "image_sample_c_cd_g16 v[0:3], [v0,v1,v3,v5,v6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
             ),
             (
-                &[0xf1ac_0f0d, 0x0040_0000, 0x0706_0501, 0x0000_0003],
+                &[0xf1ac_0f0d, 0x0040_0000, 0x0605_0301, 0x0000_0007],
                 "image_sample_c_cd_cl_g16 v[0:3], [v0,v1,v3,v5,v6,v7], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
             ),
             (
