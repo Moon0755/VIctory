@@ -927,4 +927,70 @@ mod tests {
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
     }
+
+    /// Encodings from LLVM's GFX10 assembler tests (`gfx10_asm_vop3.s`,
+    /// `gfx1011_dlops.s` and `gfx10_asm_mimg.s`). The last four G16 offsets
+    /// use the same contiguous 2D form; LLVM has their mnemonics but no
+    /// positive offset examples.
+    #[test]
+    fn rdna2_opcodes_llvm_knows_decode_with_their_operands() {
+        let cases: &[(&[u32], &str)] = &[
+            (
+                &[0xd600_0005, 0x0202_0400],
+                "v_interp_p1_f32 v5, v2, attr0.x",
+            ),
+            (
+                &[0xd601_0005, 0x0202_0400],
+                "v_interp_p2_f32 v5, v2, attr0.x",
+            ),
+            (
+                &[0xd602_0005, 0x0200_0000],
+                "v_interp_mov_f32 v5, p10, attr0.x",
+            ),
+            (
+                &[0xcc18_4000, 0x1c0e_0501],
+                "v_dot8_i32_i4 v0, v1, v2, v3",
+            ),
+            (
+                &[0xf184_021a, 0x0021_4020, 0x0000_2221],
+                "image_gather4h v[64:67], [v32,v33,v34], s[4:11], s[4:7] dmask:0x2 dim:SQ_RSRC_IMG_CUBE",
+            ),
+            (
+                &[0xf1a0_0f0b, 0x0040_0000, 0x0005_0402],
+                "image_sample_cd_g16 v[0:3], [v0,v2,v4,v5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                &[0xf1a4_0f0b, 0x0040_0000, 0x0006_0502],
+                "image_sample_cd_cl_g16 v[0:3], [v0,v2,v4,v5,v6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                &[0xf1a8_0f0b, 0x0040_0000, 0x0006_0501],
+                "image_sample_c_cd_g16 v[0:3], [v0,v1,v3,v5,v6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                &[0xf1ac_0f0d, 0x0040_0000, 0x0706_0501, 0x0000_0003],
+                "image_sample_c_cd_cl_g16 v[0:3], [v0,v1,v3,v5,v6,v7], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                &[0xf1b0_0f09, 0x0040_0000],
+                "image_sample_cd_o_g16 v[0:3], v[0:4], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                &[0xf1b4_0f09, 0x0040_0000],
+                "image_sample_cd_cl_o_g16 v[0:3], v[0:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                &[0xf1b8_0f09, 0x0040_0000],
+                "image_sample_c_cd_o_g16 v[0:3], v[0:5], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+            (
+                &[0xf1bc_0f09, 0x0040_0000],
+                "image_sample_c_cd_cl_o_g16 v[0:3], v[0:6], s[0:7], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            ),
+        ];
+        for (words, text) in cases {
+            assert_eq!(one(words, true), *text, "{words:08x?}");
+        }
+    }
+
 }
