@@ -927,4 +927,58 @@ mod tests {
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
     }
+
+    /// Throwaway audit against LLVM's gfx10 assembler vectors.
+    #[test]
+    fn llvm_vector_audit() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let (mut total, mut same, mut diff, mut lens, mut errs, mut panics) = (0, 0, 0, 0, 0, 0);
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        for chunk in crate::gfx10::llvm_vectors::all() {
+            for &(loc, words, expected, wave, flags) in chunk {
+                let waves: &[bool] = match wave {
+                    0 => &[false, true],
+                    32 => &[false],
+                    _ => &[true],
+                };
+                for &wave64 in waves {
+                    total += 1;
+                    let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    code.extend([0u8; 8]);
+                    let hex: Vec<String> = words.iter().map(|w| format!("{w:08x}")).collect();
+                    let hex = hex.join(" ");
+                    let got = catch_unwind(AssertUnwindSafe(|| {
+                        crate::gfx10::instruction(&code, 0).map(|i| (i.words.len(), i.text(wave64)))
+                    }));
+                    match got {
+                        Err(_) => {
+                            panics += 1;
+                            eprintln!("VEC-PANIC|{loc}|{hex}|{wave64}|{flags}|{expected}");
+                        }
+                        Ok(Err(e)) => {
+                            errs += 1;
+                            eprintln!("VEC-ERR|{loc}|{hex}|{wave64}|{flags}|{expected}|{e:?}");
+                        }
+                        Ok(Ok((n, text))) => {
+                            if n != words.len() {
+                                lens += 1;
+                                eprintln!(
+                                    "VEC-LEN|{loc}|{hex}|{wave64}|{flags}|{expected}|{text}|{}|{n}",
+                                    words.len()
+                                );
+                            } else if norm(&text) != norm(expected) {
+                                diff += 1;
+                                eprintln!("VEC-MISMATCH|{loc}|{hex}|{wave64}|{flags}|{expected}|{text}");
+                            } else {
+                                same += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "VEC-TOTALS|total={total}|same={same}|diff={diff}|len={lens}|err={errs}|panic={panics}"
+        );
+    }
 }
