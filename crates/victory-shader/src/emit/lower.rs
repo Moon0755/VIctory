@@ -235,8 +235,9 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
-    /// src0 of the current instruction as DPP fetched it.
-    src0: Option<V>,
+    /// src0 of the current instruction as DPP fetched it, with the index
+    /// of the source it substitutes (1 for the integer reverse opcodes).
+    src0: Option<(V, usize)>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -2074,8 +2075,8 @@ impl<'a> Lower<'a> {
                 let x = self.select_bits(x, sel, sext);
                 self.as_float(x)
             }
-            _ if k == 0 && self.src0.is_some() => {
-                let x = self.src0.expect("checked");
+            _ if self.src0.is_some_and(|(_, k1)| k == k1) => {
+                let (x, _) = self.src0.expect("checked");
                 self.as_float(x)
             }
             Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
@@ -2119,7 +2120,7 @@ impl<'a> Lower<'a> {
             return Err("integer operand modifiers");
         }
         match self.src0 {
-            Some(x) if k == 0 => Ok(x),
+            Some((x, k1)) if k == k1 => Ok(x),
             _ => {
                 let sel = Self::sdwa_src(inst, k);
                 // A byte or word select within the low half.
@@ -5816,12 +5817,19 @@ impl<'a> Lower<'a> {
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d, guard)?;
+            // Integer reverse subtract and shifts apply DPP to the second
+            // source (LLVM `isSrc1DPPRevOpcode`, verified on hardware).
+            let k1 = usize::from(matches!(
+                name,
+                "v_subrev_nc_u32" | "v_subrev_co_ci_u32" | "v_lshlrev_b32" | "v_lshrrev_b32"
+                | "v_ashrrev_i32"
+            ));
+            let (x, enable) = self.dpp(inst, d, guard, k1)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
             };
-            self.src0 = Some(x);
+            self.src0 = Some((x, k1));
         }
         let r = self.valu_op(inst, guard);
         self.src0 = None;
@@ -5830,11 +5838,11 @@ impl<'a> Lower<'a> {
 
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>) -> Result<(V, Option<V>), Why> {
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>, k1: usize) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+        let Some(&Operand::Vector { reg, .. }) = v.src.get(k1) else {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
@@ -6566,7 +6574,7 @@ impl<'a> Lower<'a> {
                     let mut xs = Vec::new();
                     for k in 0..2 {
                         let mut x = match self.src0 {
-                            Some(x) if k == 0 => x,
+                            Some((x, k1)) if k == k1 => x,
                             _ => {
                                 let op = *v.src.get(k).ok_or("a missing operand")?;
                                 let x = self.operand(inst, &op)?;
@@ -6817,7 +6825,7 @@ impl<'a> Lower<'a> {
             }
         }
         let x = match self.src0 {
-            Some(x) if k == 0 => x,
+            Some((x, k1)) if k == k1 => x,
             _ => match self.low16_src(inst, k).filter(|_| !high) {
                 Some(x) => x,
                 None => self.f16_operand(inst, &op)?,
