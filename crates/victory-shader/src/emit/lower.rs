@@ -1006,9 +1006,28 @@ impl<'a> Lower<'a> {
             }
         };
         let (iu, void, i32t) = (self.s.m.undef(self.s.t.i32), self.s.t.void, self.s.t.i32);
+        // Atomics require natural alignment: an unaligned access is dropped
+        // and its active GLC lane receives zero. Title memory uses the full
+        // address's low dword; a root view only has its byte in the host copy.
+        let access_guard = if ops.is_some() {
+            let c = self.cur;
+            let (three, zero) = (self.s.m.i32(3), self.s.m.i32(0));
+            let low = match (&memory, &root) {
+                (Some((lo, _)), _) => self.s.m.bin(c, Bin::And, *lo, three),
+                (_, Some((_, off))) => self.s.m.bin(c, Bin::And, *off, three),
+                _ => unreachable!(),
+            };
+            let aligned = self.s.m.cmp(c, pred::EQ, low, zero);
+            Some(match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, aligned),
+                None => aligned,
+            })
+        } else {
+            guard
+        };
         // Title memory is looked up (and its pages marked written) only in
         // the lanes that write.
-        let at = self.begin_guarded(guard);
+        let at = self.begin_guarded(access_guard);
         let (h, off) = match (memory, root) {
             (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, None),
             (_, Some(r)) => r,
