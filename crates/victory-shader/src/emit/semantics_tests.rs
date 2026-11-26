@@ -1485,7 +1485,10 @@ fn cube_zero_and_denormals_match_rdna2_oracle() {
             0x0000_0000,
         ),
     ];
-    let inputs: Vec<[u32; 4]> = CASES.iter().map(|&(x, y, z, _, _, _)| [x, y, z, OLD]).collect();
+    let inputs: Vec<[u32; 4]> = CASES
+        .iter()
+        .map(|&(x, y, z, _, _, _)| [x, y, z, OLD])
+        .collect();
     let expected = |col: usize| {
         move |i: [u32; 4]| {
             let (_, _, _, sc, tc, ma) = CASES
@@ -1497,9 +1500,24 @@ fn cube_zero_and_denormals_match_rdna2_oracle() {
         }
     };
     assert_clean(check(&[
-        probe(vop3(0x145, 5, [v(1), v(2), v(3)], NONE), inputs.clone(), INT, expected(0)),
-        probe(vop3(0x146, 5, [v(1), v(2), v(3)], NONE), inputs.clone(), INT, expected(1)),
-        probe(vop3(0x147, 5, [v(1), v(2), v(3)], NONE), inputs, F32, expected(2)),
+        probe(
+            vop3(0x145, 5, [v(1), v(2), v(3)], NONE),
+            inputs.clone(),
+            INT,
+            expected(0),
+        ),
+        probe(
+            vop3(0x146, 5, [v(1), v(2), v(3)], NONE),
+            inputs.clone(),
+            INT,
+            expected(1),
+        ),
+        probe(
+            vop3(0x147, 5, [v(1), v(2), v(3)], NONE),
+            inputs,
+            F32,
+            expected(2),
+        ),
     ]));
 }
 
@@ -1513,10 +1531,26 @@ fn cube_zero_and_denormals_match_rdna2_oracle() {
 #[test]
 fn cube_srcmod_bit_paths_match_rdna2_oracle() {
     const CASES: &[([u32; 3], u32, u32)] = &[
-        ([0xff80_0000, 0x8000_0007, 0x0000_0007], 0x0000_0007, 0x8000_0007),
-        ([0x7fc0_0000, 0x0000_0007, 0xff80_0000], 0xff80_0000, 0x0000_0007),
-        ([0xbf00_0000, 0x0000_0000, 0x8000_0007], 0x8000_0007, 0x0000_0000),
-        ([0x0000_0007, 0x0000_0007, 0x8000_0007], 0x0000_0007, 0x0000_0007),
+        (
+            [0xff80_0000, 0x8000_0007, 0x0000_0007],
+            0x0000_0007,
+            0x8000_0007,
+        ),
+        (
+            [0x7fc0_0000, 0x0000_0007, 0xff80_0000],
+            0xff80_0000,
+            0x0000_0007,
+        ),
+        (
+            [0xbf00_0000, 0x0000_0000, 0x8000_0007],
+            0x8000_0007,
+            0x0000_0000,
+        ),
+        (
+            [0x0000_0007, 0x0000_0007, 0x8000_0007],
+            0x0000_0007,
+            0x0000_0007,
+        ),
     ];
     let inputs: Vec<[u32; 4]> = CASES
         .iter()
