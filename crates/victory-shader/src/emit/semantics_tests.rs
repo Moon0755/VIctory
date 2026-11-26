@@ -3181,3 +3181,41 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
     ]));
 }
+
+/// RDNA2 `v_fmac_f16` in VOP3 encoding (`0x136`) honors `neg[2]` (`-acc`) and
+/// `abs[2]` (`|acc|`) on the accumulator VGPR's low half while preserving its
+/// high half (mode `0xc0`: IEEE=0, DX10_CLAMP=1, f16 denormals kept).
+/// Ten exact non-overflow, non-rounding rows (0, 1, 2, 3, 5, 6, 9, 10, 14, 15)
+/// measured on gfx1031 in `boykopovar/AnyPS5`
+/// `core/libs/prx/libSceAgcDriver/tests/execution/VFmacF16Modifiers.cpp` (`d204d17e7c`).
+#[test]
+fn v_fmac_f16_accumulator_modifiers_match_rdna2_oracle() {
+    const ROWS: [([u32; 4], u32, u32); 10] = [
+        ([0x3C00, 0x4000, 0xABCD_3C00, OLD], 0xABCD_3C00, 0xABCD_4200),
+        ([0x3C00, 0x4000, 0xABCD_BC00, OLD], 0xABCD_4200, 0xABCD_4200),
+        ([0x4000, 0x4200, 0xABCD_C600, OLD], 0xABCD_4A00, 0xABCD_4A00),
+        ([0x0000, 0xBC00, 0xABCD_0000, OLD], 0xABCD_8000, 0xABCD_0000),
+        ([0x3C00, 0x3C00, 0xABCD_7C00, OLD], 0xABCD_FC00, 0xABCD_7C00),
+        ([0x7C00, 0x3C00, 0xABCD_FC00, OLD], 0xABCD_7C00, 0xABCD_7C00),
+        ([0x3C00, 0x0001, 0xABCD_0000, OLD], 0xABCD_0001, 0xABCD_0001),
+        ([0x4000, 0x3800, 0xABCD_BC00, OLD], 0xABCD_4000, 0xABCD_4000),
+        ([0x3800, 0x3800, 0xABCD_3400, OLD], 0xABCD_0000, 0xABCD_3800),
+        ([0xBC00, 0x4000, 0xABCD_4000, OLD], 0xABCD_C400, 0xABCD_0000),
+    ];
+    let inputs: Vec<[u32; 4]> = ROWS.iter().map(|&(i, _, _)| i).collect();
+    let fmac_probe = |m: M, pick: fn(&([u32; 4], u32, u32)) -> u32| {
+        let mut body = vec![vop1(0x01, 5, v(3))];
+        body.extend(vop3(0x136, 5, [v(1), v(2), 0], m));
+        probe(body, inputs.clone(), INT, move |i| {
+            vec![pick(
+                ROWS.iter()
+                    .find(|&&(r, _, _)| r == i)
+                    .expect("known input"),
+            )]
+        })
+    };
+    assert_clean(check(&[
+        fmac_probe(M { neg: 4, ..NONE }, |r| r.1),
+        fmac_probe(M { abs: 4, ..NONE }, |r| r.2),
+    ]));
+}
