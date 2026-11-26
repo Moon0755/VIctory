@@ -2823,7 +2823,8 @@ impl<'a> Lower<'a> {
                 let (exp, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
                 let e = self.s.m.bin(c, Bin::And, ix, exp);
                 let was_zero = self.s.m.cmp(c, pred::EQ, e, zero);
-                let scaled = self.as_int(self.s.m.bin(c, Bin::Mul, r, fk));
+                let scaled = self.s.m.bin(c, Bin::Mul, r, fk);
+                let scaled = self.as_int(scaled);
                 let x = if k == 3 {
                     let min_exp = self.s.m.i32(0x0080_0000);
                     let sign_mask = self.s.m.i32(0x8000_0000);
