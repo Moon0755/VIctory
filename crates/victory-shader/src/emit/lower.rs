@@ -6043,11 +6043,12 @@ impl<'a> Lower<'a> {
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                 // Cube-map face coordinates (AMD's ISA): the major axis is z
                 // when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|,
-                // else x. Denormal coordinates read as zeros of their sign,
-                // as the console's float mode reads them: picked and negated
-                // as they are, they would come out as the host's.
-                let (x, y, z) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let (x, y, z) = (self.ftz(x), self.ftz(y), self.ftz(z));
+                // else x. Denormal coordinates read as zeros of their sign for
+                // major-axis and sign selection; `v_cubesc`/`v_cubetc` pick
+                // and bit-negate the raw operand bits, while `v_cubema`
+                // flushes a zero or denormal result to +0.
+                let (rx, ry, rz) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (x, y, z) = (self.ftz(rx), self.ftz(ry), self.ftz(rz));
                 let (ax, ay, az) = (self.unary(6, x), self.unary(6, y), self.unary(6, z));
                 let zx = self.s.m.cmp(c, pred::OGE, az, ax);
                 let zy = self.s.m.cmp(c, pred::OGE, az, ay);
@@ -6055,9 +6056,9 @@ impl<'a> Lower<'a> {
                 let ymaj = self.s.m.cmp(c, pred::OGE, ay, ax);
                 let zero = self.s.m.f32(0);
                 let neg = |l: &mut Self, v: V| l.s.m.cmp(c, pred::OLT, v, zero);
-                let minus = |l: &mut Self, v: V| {
-                    let z = l.s.m.f32(0x8000_0000);
-                    l.s.m.bin(c, Bin::Sub, z, v)
+                let neg_bits = |l: &mut Self, bits: V| {
+                    let sign = l.s.m.i32(0x8000_0000);
+                    l.s.m.bin(c, Bin::Xor, bits, sign)
                 };
                 let pick = |l: &mut Self, zv: V, yv: V, xv: V| {
                     let t = l.s.m.select(c, ymaj, yv, xv);
@@ -6081,22 +6082,32 @@ impl<'a> Lower<'a> {
                         pick(self, zf, yf, xf)
                     }
                     "v_cubesc_f32" => {
+                        let (ix, iz) = (self.as_int(rx), self.as_int(rz));
                         let (nz, nx) = (neg(self, z), neg(self, x));
-                        let (mx, mz) = (minus(self, x), minus(self, z));
-                        let zf = self.s.m.select(c, nz, mx, x);
-                        let xf = self.s.m.select(c, nx, z, mz);
-                        pick(self, zf, x, xf)
+                        let (mx, mz) = (neg_bits(self, ix), neg_bits(self, iz));
+                        let zf = self.s.m.select(c, nz, mx, ix);
+                        let xf = self.s.m.select(c, nx, iz, mz);
+                        let bits = pick(self, zf, ix, xf);
+                        self.as_float(bits)
                     }
                     "v_cubetc_f32" => {
+                        let (iy, iz) = (self.as_int(ry), self.as_int(rz));
                         let ny = neg(self, y);
-                        let (my, mz) = (minus(self, y), minus(self, z));
-                        let yf = self.s.m.select(c, ny, mz, z);
-                        pick(self, my, yf, my)
+                        let (my, mz) = (neg_bits(self, iy), neg_bits(self, iz));
+                        let yf = self.s.m.select(c, ny, mz, iz);
+                        let bits = pick(self, my, yf, my);
+                        self.as_float(bits)
                     }
                     _ => {
                         let t = pick(self, z, y, x);
                         let two = self.s.m.f32(2.0f32.to_bits());
-                        self.s.m.bin(c, Bin::Mul, t, two)
+                        let p = self.s.m.bin(c, Bin::Mul, t, two);
+                        let p_bits = self.as_int(p);
+                        let (exp, kzero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
+                        let e = self.s.m.bin(c, Bin::And, p_bits, exp);
+                        let tiny = self.s.m.cmp(c, pred::EQ, e, kzero);
+                        let bits = self.s.m.select(c, tiny, kzero, p_bits);
+                        self.as_float(bits)
                     }
                 };
                 float(self, r)
