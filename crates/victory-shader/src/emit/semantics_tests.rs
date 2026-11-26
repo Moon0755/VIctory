@@ -246,8 +246,9 @@ fn program(body: &[u32], scalar: bool) -> Vec<u32> {
 
 /// Lowers a probe's program: a 64-thread group of two waves of 32, 512
 /// bytes of LDS; one view table at s4 (the input buffer, then the output
-/// UAV), the group id in s6.
-fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+/// UAV), the group id in s6. With `native16`, for a host with native 16-bit
+/// operations (`Options::native16`).
+fn lower_program(words: &[u32], native16: bool) -> Result<HostShader, String> {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -293,6 +294,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        native16,
     })
     .map_err(e)?;
     Ok(HostShader {
@@ -547,18 +549,38 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// Runs probes on the hardware adapter and WARP; returns the failures
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
+    check_with(probes, false, &[("hardware", false), ("warp", true)])
+}
+
+/// [`check`] lowered for hosts with native 16-bit operations, on those of
+/// `adapters` (label, WARP) that have them; nothing where none does.
+fn check_native(probes: &[Probe], adapters: &[(&'static str, bool)]) -> Vec<String> {
+    check_with(probes, true, adapters)
+}
+
+fn check_with(probes: &[Probe], native16: bool, adapters: &[(&'static str, bool)]) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
-        .into_iter()
-        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
+    let mut hosts: Vec<(&str, bool, Host)> = adapters
+        .iter()
+        .filter_map(|&(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
+        .filter(|(label, _, h)| {
+            let skip = native16 && !h.native16();
+            if skip {
+                eprintln!("{label}: no native 16-bit operations rounding FMad once; skipped");
+            }
+            !skip
+        })
         .collect();
+    if native16 && hosts.is_empty() {
+        return Vec::new();
+    }
     assert!(!hosts.is_empty(), "no SM 6.6 device");
     let report = std::env::var("VICTORY_SEMANTICS_REPORT").ok();
     let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref());
     let mut failures = Vec::new();
     for p in probes {
         let what = disassembly(&p.body, p.scalar);
-        let shader = match lower_program(&program(&p.body, p.scalar)) {
+        let shader = match lower_program(&program(&p.body, p.scalar), native16) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{what}: not lowered: {e}");
@@ -2335,6 +2357,396 @@ fn sixteen_bit_probes() -> Vec<Probe> {
 #[test]
 fn sixteen_bit_floats_match_the_hardware() {
     assert_clean(check(&passing(sixteen_bit_probes())));
+}
+
+// Native 16-bit arithmetic (`Options::native16`): sums, differences,
+// products, minima, maxima, medians and fused multiply-adds in `half`, on
+// adapters that have native 16-bit operations and round a 16-bit `FMad`
+// once (`Host::native16`), as the RTX 4070 Ti and RTX 5070 Ti do and the
+// console's `v_fma_f16` does. WARP rounds it in f32 first (#2384) and keeps
+// the f32 path, which rounds `v_fma_f16` once itself; it skips these.
+// Results must be the model's (NaN as any NaN: the payload is the host's).
+
+/// The host check `victory-gpu` makes for `Options::native16`: WARP has
+/// native 16-bit operations but rounds a 16-bit `FMad` in f32 first, so it
+/// is refused.
+#[test]
+fn hosts_that_round_f16_fmad_twice_keep_the_f32_path() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(warp) = Host::new(true) {
+        assert_eq!(warp.rounds_f16_fmad_once(), Ok(false), "WARP");
+        assert!(!warp.native16(), "WARP");
+    }
+    if let Ok(hardware) = Host::new(false) {
+        let once = hardware.rounds_f16_fmad_once();
+        eprintln!("hardware adapter rounds a 16-bit FMad once: {once:?}");
+        assert!(once.is_ok(), "the check runs");
+    }
+}
+
+#[test]
+fn sixteen_bit_floats_match_the_hardware_natively() {
+    assert_clean(check_native(
+        &passing(sixteen_bit_probes()),
+        &[("hardware", false), ("warp", true)],
+    ));
+}
+
+/// The inputs #2384 found to tell one rounding of a 16-bit multiply-add
+/// from two: (a, b, c) and the result rounded once. The first also cancels
+/// (a separate multiply and add give 0x1800).
+const F16_FMA_CASES: &[[u32; 4]] = &[
+    [0x3C01, 0x3E00, 0x8001, 0x3E01],
+    [0x3C03, 0x3E00, 0x0001, 0x3E05],
+    [0x3C01, 0x3E00, 0xBE00, 0x1600],
+];
+
+#[test]
+fn the_f16_fma_cases_round_once_in_the_model() {
+    for &[a, b, c, want] in F16_FMA_CASES {
+        assert_eq!(
+            to_f16(h(a).mul_add(h(b), h(c)), false),
+            want,
+            "{a:04x} {b:04x} {c:04x}"
+        );
+    }
+    // Rounded to f32 first, the first two land on an f16 tie.
+    assert!(twice(h(0x3C01).mul_add(h(0x3E00), h(0x8001))));
+    assert!(twice(h(0x3C03).mul_add(h(0x3E00), h(0x0001))));
+}
+
+/// `n` inputs of three finite f16 operands in the low halves (a fixed
+/// sequence), the high halves junk, v5 = d.
+fn random_halves(n: usize) -> Vec<[u32; 4]> {
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    (0..n)
+        .map(|_| {
+            let mut i = [0u32; 4];
+            for k in &mut i {
+                let r = next();
+                // Exponents 0..=30: no infinity or NaN.
+                let e = (r >> 16) as u32 % 31;
+                *k = (r as u32 & 0x83FF | e << 10) | (r >> 32) as u32 & 0xFFFF_0000;
+            }
+            i
+        })
+        .collect()
+}
+
+/// The fused probes' inputs the f32 path rounds twice (`F16_DOUBLE`; the
+/// packed ones still do), #2384's and random ones, natively on the
+/// hardware adapter: rounded once there.
+#[test]
+fn fused_f16_results_round_once_natively() {
+    let mut p = defective(sixteen_bit_probes(), F16_DOUBLE);
+    let cases = |high: u32| -> Vec<[u32; 4]> {
+        F16_FMA_CASES
+            .iter()
+            .map(|&[a, b, c, _]| [a | high, b | high, c | high, 0x5A5A_3C00])
+            .collect()
+    };
+    let fma3 = |i: [u32; 4], d: u32| {
+        vec![d & 0xFFFF_0000 | to_f16(h(i[0]).mul_add(h(i[1]), h(i[2])), false)]
+    };
+    p.push(probe(
+        vop3(0x34B, 5, [v(1), v(2), v(3)], NONE),
+        cases(0x3C00 << 16),
+        F16,
+        move |i| fma3(i, i[3]),
+    ));
+    // Finite operands of every exponent (and sign), denormals included.
+    p.push(probe(
+        vop3(0x34B, 5, [v(1), v(2), v(3)], NONE),
+        random_halves(8192),
+        F16,
+        move |i| fma3(i, i[3]),
+    ));
+    p.push(probe(
+        [vop1(0x01, 5, v(3)), vop2(0x36, 5, v(1), 2)],
+        cases(0x3C00 << 16),
+        F16,
+        move |i| fma3(i, i[2]),
+    ));
+    // v_pk_fma_f16 with the same case in both halves.
+    p.push(probe(
+        vop3p(0x0E, 5, [v(1), v(2), v(3)], 0, 7, [0, 0]),
+        F16_FMA_CASES
+            .iter()
+            .map(|&[a, b, c, _]| [a | a << 16, b | b << 16, c | c << 16, 0])
+            .collect(),
+        Kind::Halves { ulps: 0 },
+        |i| {
+            let r = to_f16(h(i[0]).mul_add(h(i[1]), h(i[2])), false);
+            vec![r | r << 16]
+        },
+    ));
+    assert_clean(check_native(&p, &[("hardware", false)]));
+}
+
+/// A program that sets toward zero for 16-bit results keeps them in f32
+/// (`half` cannot round so), natively too; nearest even again, they are
+/// in `half`. Only the second sum is native.
+#[test]
+fn f16_results_round_as_the_mode_says_natively() {
+    let setreg = |mode: u32| [0xBA80_0881u32, mode];
+    let mut body = setreg(3).to_vec();
+    body.push(vop2(0x32, 5, v(1), 2));
+    body.extend(setreg(0));
+    body.push(vop2(0x32, 6, v(1), 2));
+    let sum = |i: [u32; 4], rtz: bool| to_f16(h(i[0]) + h(i[1]), rtz);
+    // Without the sums the f32 path rounds in f32 first, then toward zero
+    // to another half (a denormal or far smaller operand: [`F16_TWICE`]).
+    let mut ins = half_pairs();
+    ins.retain(|&i| {
+        let x = h(i[0]) + h(i[1]);
+        to_f16(f64::from(x as f32), true) == to_f16(x, true)
+    });
+    assert_clean(check_native(
+        &[probe(body, ins, F16, move |i| {
+            vec![
+                i[3] & 0xFFFF_0000 | sum(i, true),
+                i[3] & 0xFFFF_0000 | sum(i, false),
+            ]
+        })],
+        &[("hardware", false), ("warp", true)],
+    ));
+}
+
+/// Whether a lowered program declares native 16-bit operations (`SFI0`).
+fn declares_native16(shader: &HostShader) -> bool {
+    let c = crate::dxbc::Container::parse(&shader.dxil).expect("a container");
+    let sfi0 = c.part(crate::dxbc::FourCC::SFI0).expect("SFI0");
+    u64::from_le_bytes(sfi0.data[..8].try_into().expect("8 bytes")) & 0x4_0000 != 0
+}
+
+/// An f16 sum or product with an output modifier takes the f32 path with
+/// `native16`: both lowerings translate it alike or refuse it alike, and a
+/// translated one declares no native 16-bit operations.
+#[test]
+fn output_modifiers_on_f16_results_take_the_f32_path_natively() {
+    // v_add_f16 and v_mul_f16 as VOP3; mul:2, mul:4 and div:2.
+    for op in [0x132u16, 0x135] {
+        for omod in 1..=3 {
+            let body = vop3(op, 5, [v(1), v(2), 0], M { omod, ..NONE });
+            let what = disassembly(&body, false);
+            let words = program(&body, false);
+            let f32_path = lower_program(&words, false);
+            let native = lower_program(&words, true);
+            match (&f32_path, &native) {
+                (Ok(_), Ok(n)) => assert!(!declares_native16(n), "{what}"),
+                (Err(a), Err(b)) => assert_eq!(a, b, "{what}"),
+                (a, b) => panic!("{what}: f32 path {:?}, native {:?}", a.is_ok(), b.is_ok()),
+            }
+        }
+    }
+}
+
+/// Native 16-bit operations are declared exactly where `half` is used:
+/// with `native16`, for the f16 arithmetic, not for programs that round
+/// toward zero or only convert.
+#[test]
+fn native_16bit_operations_are_declared_where_used() {
+    let add = [vop2(0x32, 5, v(1), 2)];
+    let pk_fma = vop3p(0x0E, 5, [v(1), v(2), v(3)], 0, 7, [0, 0]);
+    let cvt = [vop1(0x0A, 5, v(1))];
+    let mut rtz = vec![0xBA80_0881u32, 3];
+    rtz.push(vop2(0x32, 5, v(1), 2));
+    let lowered =
+        |body: &[u32], native16| lower_program(&program(body, false), native16).expect("lowered");
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    for (body, native) in [
+        (&add[..], true),
+        (&pk_fma[..], true),
+        (&cvt[..], false),
+        (&rtz[..], false),
+    ] {
+        let what = disassembly(body, false);
+        assert!(
+            !declares_native16(&lowered(body, false)),
+            "{what}: f32 path"
+        );
+        let shader = lowered(body, true);
+        assert_eq!(declares_native16(&shader), native, "{what}");
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut shader.dxil.clone())
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
+    }
+}
+
+/// What native 16-bit arithmetic saves: dependent chains of the
+/// console's f16 instructions, lowered for the f32 path and natively, timed
+/// on the hardware adapter (GPU timestamps around back-to-back dispatches,
+/// the best of five). `cargo test -p victory-shader --release --lib
+/// translated_f16_math -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark"]
+fn translated_f16_math_costs() {
+    // Instructions in each chain: long enough that a dispatch's fixed cost
+    // does not hide the arithmetic (at 512 it did on an RX 9070 XT).
+    const CHAIN: usize = 4096;
+    const GROUPS: u32 = 4096;
+    const TIMES: u32 = 10;
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no hardware adapter; skipped");
+        return;
+    };
+    if !host.native16() {
+        eprintln!("no native 16-bit operations; skipped");
+        return;
+    }
+    // `step`'s words make `insts` instructions (VOP3 and VOP3P take two
+    // words each): the chain holds CHAIN instructions whatever their size.
+    let chain = |step: &[u32], insts: usize| -> Vec<u32> {
+        let mut b = vec![vop1(0x01, 5, v(1))];
+        for _ in 0..CHAIN / insts.max(1) {
+            b.extend_from_slice(step);
+        }
+        b
+    };
+    let pk_fma = vop3p(0x0E, 5, [v(5), v(2), v(3)], 0, 7, [0, 0]);
+    let fma = vop3(0x34B, 5, [v(5), v(2), v(3)], NONE);
+    // (body, f16 operations per thread)
+    let cases: [(&str, Vec<u32>, usize); 3] = [
+        ("v_pk_fma_f16", chain(&pk_fma, 1), 2 * CHAIN),
+        ("v_fma_f16", chain(&fma, 1), CHAIN),
+        (
+            "v_mul_f16 + v_add_f16",
+            chain(&[vop2(0x35, 5, v(5), 2), vop2(0x32, 5, v(5), 3)], 2),
+            CHAIN,
+        ),
+    ];
+    // Halves near 1 so the chains neither overflow nor vanish.
+    let threads = 64 * GROUPS as usize;
+    let mut x = 0x9E37_79B9u32;
+    let mut half = move || {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        0x3800 | x & 0x03FF
+    };
+    let inputs: Vec<[u32; 4]> = (0..threads)
+        .map(|_| {
+            let (a, b, c) = (half(), half(), half() ^ 0x8000);
+            [a | a << 16, b | b << 16, c | c << 16, 0]
+        })
+        .collect();
+    let data: Vec<u32> = inputs.iter().flatten().copied().collect();
+    for (what, body, ops) in cases {
+        let words = program(&body, false);
+        let mut results = Vec::new();
+        for native16 in [false, true] {
+            let shader = lower_program(&words, native16).expect("lowered");
+            let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+            let views = [
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Raw,
+                },
+                View::RawUav(GROUPS * 64 * 4),
+            ];
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let d = Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &views,
+                samplers: &[],
+                groups: [GROUPS, 1, 1],
+            };
+            let mut best = f64::MAX;
+            let mut out = Vec::new();
+            for _ in 0..5 {
+                let (o, t) = host
+                    .dispatch_timed(&root, &pso, &d, TIMES)
+                    .expect("dispatch");
+                best = best.min(t / f64::from(TIMES));
+                out = o;
+            }
+            let rate = (threads * ops) as f64 / best / 1e9;
+            eprintln!(
+                "{what:>22} {:>6}: {:8.3} ms  {rate:8.0} G f16 ops/s",
+                if native16 { "native" } else { "f32" },
+                best * 1e3
+            );
+            results.push((best, out));
+        }
+        let (f32_path, native) = (&results[0], &results[1]);
+        let same = f32_path.1[0]
+            .chunks(4)
+            .zip(native.1[0].chunks(4))
+            .filter(|(a, b)| a[0] == b[0])
+            .count();
+        eprintln!(
+            "{what:>22}  speed-up {:.1}x; results alike in {same} of {threads} threads",
+            f32_path.0 / native.0
+        );
+    }
+}
+
+/// Each 16-bit probe, all its inputs, and random fused multiply-adds,
+/// lowered both ways on every adapter with native 16-bit operations:
+/// wherever the two results differ, the native one is the model's (it is
+/// never further from the console): only on fused results the f32 path
+/// rounds twice.
+#[test]
+fn native_f16_is_never_further_from_the_console() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut failures = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Some(host) = Host::new(warp).ok().filter(Host::native16) else {
+            eprintln!("{label}: no native 16-bit operations rounding FMad once; skipped");
+            continue;
+        };
+        let mut apart = 0usize;
+        let random = probe(
+            vop3(0x34B, 5, [v(1), v(2), v(3)], NONE),
+            random_halves(8192),
+            F16,
+            |i| vec![i[3] & 0xFFFF_0000 | to_f16(h(i[0]).mul_add(h(i[1]), h(i[2])), false)],
+        );
+        for p in sixteen_bit_probes().into_iter().chain([random]) {
+            let what = disassembly(&p.body, p.scalar);
+            let words = program(&p.body, p.scalar);
+            let run_as = |native16| {
+                let shader = lower_program(&words, native16)?;
+                run(&host, &shader, &p.inputs, p.scalar)
+            };
+            let (ours, native) = match (run_as(false), run_as(true)) {
+                (Ok(a), Ok(b)) => (a, b),
+                (a, b) => {
+                    failures.push(format!("{what}: {label}: {:?} {:?}", a.err(), b.err()));
+                    continue;
+                }
+            };
+            let model = p.model.as_ref().expect("16-bit probes have a model");
+            for (k, &i) in p.inputs.iter().enumerate() {
+                let want = model(i);
+                let fits = |r: &[u32; 4]| want.iter().zip(r).all(|(&w, &g)| same(p.kind, w, g));
+                let alike = ours[k]
+                    .iter()
+                    .zip(&native[k])
+                    .all(|(&a, &b)| same(p.kind, a, b));
+                if !alike {
+                    apart += 1;
+                    if !fits(&native[k]) || warp {
+                        let got = format!("f32 path {:08x?} native {:08x?}", ours[k], native[k]);
+                        failures.push(format!(
+                            "{what}: {label}: in {i:08x?} want {want:08x?} {got}"
+                        ));
+                    }
+                }
+            }
+        }
+        eprintln!("{label}: native and f32 paths differ on {apart} inputs");
+    }
+    assert_clean(failures);
 }
 
 /// `v_fma_mix*`: each source an f32 (a denormal read as zero, measured on

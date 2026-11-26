@@ -127,6 +127,23 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// Whether translated shaders do the console's f16 arithmetic in native
+/// `half` (`victory_shader::emit::Options::native16`): the host GPU runs
+/// native 16-bit operations and rounds a 16-bit `FMad` once (a dispatch,
+/// as `fuses_fmad`'s). `VICTORY_F16_IN_F32=1` keeps it in f32 on any host.
+/// Asked once.
+pub(crate) fn native16() -> bool {
+    static NATIVE: OnceLock<bool> = OnceLock::new();
+    *NATIVE.get_or_init(|| {
+        let native = !crate::switch::on("VICTORY_F16_IN_F32")
+            && host().is_some_and(|h| {
+                victory_shader::emit::host::Host::from_device(h.device.clone()).native16()
+            });
+        tracing::info!(native, "host native 16-bit float operations");
+        native
+    })
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {

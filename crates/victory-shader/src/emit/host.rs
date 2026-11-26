@@ -595,6 +595,31 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// What [`super::Options::native16`] asks of the host: native 16-bit
+    /// operations (D3D12 `Native16BitShaderOpsSupported`, SM 6.2 and up,
+    /// which the device already has) whose 16-bit `FMad` rounds once, as
+    /// the console's `v_fma_f16` does ([`Self::rounds_f16_fmad_once`]). WARP
+    /// has the operations but rounds a 16-bit `FMad` in f32 first, where the
+    /// f32 path rounds `v_fma_f16` once.
+    pub fn native16(&self) -> bool {
+        self.native16_ops() && self.rounds_f16_fmad_once().unwrap_or(false)
+    }
+
+    /// Whether the device reports native 16-bit operations.
+    fn native16_ops(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        // SAFETY: the query writes the structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS4,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.Native16BitShaderOpsSupported.as_bool()
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
@@ -602,11 +627,25 @@ impl Host {
     /// the lowered `v_fma_f32` of (1 - 2^-24, 1 + 2^-23, -1) once: 2^-24 -
     /// 2^-47 fused, 0 not.
     pub fn fuses_fmad(&self) -> Result<bool, String> {
-        let shader = fmad_probe().map_err(|e| e.to_string())?;
+        let r = self.fmad_probe(V_FMA_F32, false, [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000])?;
+        Ok(r != 0)
+    }
+
+    /// Whether `v_fma_f16`, lowered natively (`half` `FMad`), rounds once
+    /// here: (1 + 2^-10) × 1.5 - 2^-24 (#2384) is 0x3E01 rounded once,
+    /// 0x3E02 rounded in f32 first (WARP).
+    pub fn rounds_f16_fmad_once(&self) -> Result<bool, String> {
+        let r = self.fmad_probe(V_FMA_F16, true, [0x3C01, 0x3E00, 0x8001])?;
+        Ok(r & 0xFFFF == 0x3E01)
+    }
+
+    /// The dword the lowered `fma` (a VOP3 multiply-add of v1, v2, v3 into
+    /// v0) leaves for `operands`, run once.
+    fn fmad_probe(&self, fma: [u32; 2], native16: bool, operands: [u32; 3]) -> Result<u32, String> {
+        let shader = fmad_probe(fma, native16).map_err(|e| e.to_string())?;
         let (root, pso) = self.compute_pipeline(&shader)?;
         // Taken after the pipeline, which takes it itself.
         let _guard = self.lock_warp();
-        let operands = [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000];
         let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             if u.root == crate::native::RootType::Constants {
@@ -727,14 +766,20 @@ impl Host {
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let bits = p.cast::<u32>().read();
             readback.Unmap(0, None);
-            Ok(bits != 0)
+            Ok(bits)
         }
     }
 }
 
-/// `v_fma_f32 v0, s0, s1, s2` (through VGPRs) stored to dword 0 of the raw
-/// UAV a table at s4 names, lowered as a title's program is.
-fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
+/// `v_fma_f32 v0, v1, v2, v3`.
+const V_FMA_F32: [u32; 2] = [0xD54B_0000, 0x040E_0501];
+/// `v_fma_f16 v0, v1, v2, v3`.
+const V_FMA_F16: [u32; 2] = [0xD74B_0000, 0x040E_0501];
+
+/// `fma` (a VOP3 multiply-add `v0, v1, v2, v3`) of s0, s1, s2 (through
+/// VGPRs) stored to dword 0 of the raw UAV a table at s4 names, lowered as
+/// a title's program is (with [`super::Options::native16`] if asked).
+fn fmad_probe(fma: [u32; 2], native16: bool) -> Result<HostShader, crate::ShaderError> {
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -745,8 +790,8 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         0x7E02_0200, // v_mov_b32 v1, s0
         0x7E04_0201, // v_mov_b32 v2, s1
         0x7E06_0202, // v_mov_b32 v3, s2
-        0xD54B_0000, // v_fma_f32 v0, v1, v2, v3
-        0x040E_0501,
+        fma[0],
+        fma[1],
         0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
         0x8002_0000,
         0xBF81_0000, // s_endpgm
@@ -798,6 +843,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        native16,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -1402,6 +1448,18 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_timed(root, pso, d, 1).map(|(out, _)| out)
+    }
+
+    /// [`Self::dispatch`] `times` times over, back to back, with the GPU
+    /// time between the first and the last in seconds (timestamps).
+    pub fn dispatch_timed(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        times: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
         let _guard = self.lock_warp();
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1964,7 +2022,30 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            let queries: ID3D12QueryHeap = {
+                let mut q: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut q,
+                )
+                .map_err(err)?;
+                q.ok_or("no query heap")?
+            };
+            let stamps = make(
+                D3D12_HEAP_TYPE_READBACK,
+                &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            list.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            for _ in 0..times {
+                list.Dispatch(x, y, z);
+            }
+            list.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list.ResolveQueryData(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &stamps, 0);
             for (r, size, n, rb) in &uavs {
                 list.ResourceBarrier(&[transition(
                     r,
@@ -2016,8 +2097,13 @@ impl Host {
                 rb.Unmap(0, None);
                 out.push(words);
             }
+            let mut p = std::ptr::null_mut();
+            stamps.Map(0, None, Some(&mut p)).map_err(err)?;
+            let [t0, t1] = p.cast::<[u64; 2]>().read();
+            stamps.Unmap(0, None);
+            let hz = queue.GetTimestampFrequency().map_err(err)?;
             drop(keep);
-            Ok(out)
+            Ok((out, t1.saturating_sub(t0) as f64 / hz as f64))
         }
     }
 }
