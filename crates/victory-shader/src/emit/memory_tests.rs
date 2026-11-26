@@ -321,6 +321,143 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// GLOBAL atomics require natural alignment too: a misaligned lane is dropped,
+/// its memory stays untouched and its GLC result is zero. Each lane adds 7 at
+/// `8*lane+4` (aligned), then at `8*lane+5` (misaligned); the second GLC result
+/// is stored at `0x100+4*lane`. If the host rounds the misaligned byte offset
+/// down, both atomics hit the same dword: 14 in memory and 7 returned.
+#[test]
+fn unaligned_global_atomics_are_dropped_and_return_zero() {
+    const V_LSHLREV_B32: u32 = 0x1A;
+    const V_ADD_NC_U32: u32 = 0x25;
+    const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+    }
+    const fn global_glc(op: u32, vdst: u8, vaddr: u8, data: u8, saddr: u8, offset: u32) -> [u32; 2] {
+        let [a, b] = global(op, vdst, vaddr, data, saddr, offset);
+        [a | 1 << 16, b]
+    }
+    let mut w = vec![
+        vop2(V_LSHLREV_B32, 1, 128 + 3, 0), // v1 = lane * 8
+        vop2(V_ADD_NC_U32, 2, 128 + 4, 1),  // v2 = lane * 8 + 4
+        vop2(V_ADD_NC_U32, 3, 128 + 5, 1),  // v3 = lane * 8 + 5
+        v_mov_b32(4, 2),                    // v4 = s2 (7)
+    ];
+    w.extend(global_glc(0x32, 5, 2, 4, 0, 0)); // aligned global_atomic_add
+    w.extend(global_glc(0x32, 6, 3, 4, 0, 0)); // misaligned global_atomic_add
+    w.push(S_WAITCNT_ALL);
+    w.push(vop2(V_LSHLREV_B32, 7, 128 + 2, 0)); // v7 = lane * 4
+    w.extend(global(0x1C, 0, 7, 6, 0, 0x100)); // global_store_dword at +0x100
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let memory = res.scalar.iter().filter(|s| s.1.param == resource::MEMORY).count();
+    assert_eq!(memory, 3, "both atomics and the result store are title memory");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.memory && l.memory_writes);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let memory = vec![0u32; 256];
+    let mut want = vec![0u32; 256];
+    for lane in 0..32usize {
+        want[2 * lane + 1] = 7;
+    }
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            let constants = [TITLE as u32, (TITLE >> 32) as u32, 7, 0];
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => constants[u.dword as usize],
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(1),
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[1], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// A root SRV in a program that does not use title memory is read through
 /// the host's view of its host copy (`emit`, "Root SRVs and root UAVs"): the
 /// view's index and the root address's offset in it come as user data, and
