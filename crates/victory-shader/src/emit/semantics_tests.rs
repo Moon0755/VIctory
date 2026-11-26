@@ -2814,6 +2814,40 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// Bit scans, tied bit sets and high multiplies write no SCC on the console:
+/// the RDNA2 ISA writes `SCC = (D != 0)` into the pseudocode of every scalar
+/// instruction that produces one and writes nothing of the sort into theirs,
+/// and LLVM's instruction definitions agree. A compare's outcome survives
+/// them in both directions — captured once set, once cleared.
+#[test]
+fn scalar_bit_scans_write_no_scc() {
+    // A lowering writing SCC = (result != 0) flips one of the captures on
+    // every input, because the result either is zero or it is not.
+    let keeps = |tested: &[u32], inputs: Vec<[u32; 4]>| -> Probe {
+        let mut body = vec![sopc(0x06, s(16), s(16))]; // s_cmp_eq_u32 s16, s16: SCC = 1
+        body.extend_from_slice(tested);
+        body.push(sop2(0x0A, 21, int(1), int(0))); // s_cselect_b32 s21, 1, 0
+        body.push(sopc(0x07, s(16), s(16))); // s_cmp_ne_u32 s16, s16: SCC = 0
+        body.extend_from_slice(tested);
+        body.push(sop2(0x0A, 22, int(1), int(0))); // s_cselect_b32 s22, 1, 0
+        body.push(vop1(0x01, 5, s(21)));
+        body.push(vop1(0x01, 6, s(22)));
+        scalar(body, inputs, |_| vec![1, 0])
+    };
+    let one = unary(U32_EDGES);
+    let two = pairs(&U32_EDGES[..24], &U32_EDGES[..24]);
+    let p = vec![
+        keeps(&[sop1(0x13, 20, s(16))], one.clone()), // s_ff1_i32_b32
+        keeps(&[sop1(0x15, 20, s(16))], one.clone()), // s_flbit_i32_b32
+        keeps(&[sop1(0x17, 20, s(16))], one.clone()), // s_flbit_i32
+        keeps(&[sop1(0x03, 20, s(17)), sop1(0x1B, 20, s(16))], two.clone()), // s_bitset0_b32
+        keeps(&[sop1(0x03, 20, s(17)), sop1(0x1D, 20, s(16))], two.clone()), // s_bitset1_b32
+        keeps(&[sop2(0x35, 20, s(16), s(17))], two.clone()), // s_mul_hi_u32
+        keeps(&[sop2(0x36, 20, s(16), s(17))], two.clone()), // s_mul_hi_i32
+    ];
+    assert_clean(check(&passing(p)));
+}
+
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the

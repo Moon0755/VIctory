@@ -1053,7 +1053,7 @@ fn buffer_load_ushort_joins_bytes_across_dwords() {
         .unwrap_or_else(|e| e.into_inner());
     // Byte `i` of the copy is `i` (for `i < 256`).
     let copy: Vec<u32> = (0..64u32)
-        .map(|k| 4 * k | (4 * k + 1) << 8 | (4 * k + 2) << 16 | (4 * k + 3) << 24)
+        .map(|k| (4 * k) | ((4 * k + 1) << 8) | ((4 * k + 2) << 16) | ((4 * k + 3) << 24))
         .collect();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -1088,7 +1088,7 @@ fn buffer_load_ushort_joins_bytes_across_dwords() {
         // in its low byte and byte `4*l+4` — byte 0 of the next dword — in
         // its high byte.
         let want: Vec<u32> = (0..32)
-            .map(|lane| 4 * lane + 3 | (4 * lane + 4) << 8)
+            .map(|lane| (4 * lane + 3) | ((4 * lane + 4) << 8))
             .collect();
         assert_eq!(out[0], want.as_slice(), "{label}");
         ran += 1;
