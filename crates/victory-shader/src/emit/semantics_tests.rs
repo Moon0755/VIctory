@@ -1559,6 +1559,35 @@ fn cube_srcmod_bit_paths_match_rdna2_oracle() {
     ]));
 }
 
+/// The clamped column `v_cubesc_f32 v23, v4, -v5, |v6| clamp` of AnyPS5's
+/// Vop3CubeClamp.cpp (rows 6, 8 and 11 of `Expected`, column 13, mode
+/// FLOAT_MODE=0xc0 IEEE=0): under abs on z a NEGATIVE denormal z is selected
+/// (in row 8 through the negative x axis) and reaches the output as a
+/// positive denormal, which clamp keeps — no other probe selects a negative
+/// denormal with abs on.
+#[test]
+fn clamped_cube_abs_of_negative_denormal_matches_rdna2_oracle() {
+    const CASES: &[[u32; 3]] = &[
+        [0xff80_0000, 0x8000_0007, 0x0000_0007],
+        [0xbf00_0000, 0x0000_0000, 0x8000_0007],
+        [0x0000_0007, 0x0000_0007, 0x8000_0007],
+    ];
+    let inputs: Vec<[u32; 4]> = CASES.iter().map(|&[x, y, z]| [x, y, z, OLD]).collect();
+    // clamp, abs on z (bit 2), neg on y (bit 1).
+    let mods = M {
+        abs: 4,
+        neg: 2,
+        clamp: true,
+        ..NONE
+    };
+    assert_clean(check(&[probe(
+        vop3(0x145, 5, [v(1), v(2), v(3)], mods),
+        inputs,
+        INT,
+        |_| vec![7],
+    )]));
+}
+
 /// The clamped SC/TC outputs measured in AnyPS5's Vop3CubeClamp.cpp
 /// (f457d87b, rows 6, 7, 8, 11 and 16), with no output multiplier.
 #[test]
