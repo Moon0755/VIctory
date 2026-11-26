@@ -3525,6 +3525,22 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        if matches!(inst.fields, Fields::Image { .. })
+            && matches!(
+                name,
+                "image_gather4h"
+                    | "image_sample_cd_g16"
+                    | "image_sample_cd_cl_g16"
+                    | "image_sample_c_cd_g16"
+                    | "image_sample_c_cd_cl_g16"
+                    | "image_sample_cd_o_g16"
+                    | "image_sample_cd_cl_o_g16"
+                    | "image_sample_c_cd_o_g16"
+                    | "image_sample_c_cd_cl_o_g16"
+            )
+        {
+            return Err(unsupported(offset, name));
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),

@@ -579,6 +579,8 @@ impl Instruction {
                                 chan: (code >> 6 & 3) as u8,
                                 high: code >> 8 & 1 == 1,
                             }
+                        } else if i == 1 && name == "v_interp_mov_f32" {
+                            Operand::Const(code as u8)
                         } else if i == 2 && carry_in {
                             source(code, lanes, w(2))
                         } else {
@@ -647,6 +649,9 @@ const VOP3_TWO_SOURCES: &[&str] = &[
     "v_cvt_pknorm_i16_f16",
     "v_cvt_pknorm_u16_f16",
     "v_lshlrev_b16",
+    "v_interp_p1_f32",
+    "v_interp_p2_f32",
+    "v_interp_mov_f32",
     "v_interp_p1ll_f16",
     "v_readlane_b32",
     "v_writelane_b32",
