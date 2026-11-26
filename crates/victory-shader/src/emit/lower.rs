@@ -6064,22 +6064,8 @@ impl<'a> Lower<'a> {
                 // denormal survives however the host's float abs/neg treats it.
                 let bits = |l: &mut Self, k: usize| -> Result<V, Why> {
                     let op = *v.src.get(k).ok_or("a missing operand")?;
-                    let mut b = match op {
-                        _ if k == 0 && l.src0.is_some() => l.src0.expect("checked"),
-                        Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
-                            if !matches!(op, Operand::Scalar { code: NULL, .. }) =>
-                        {
-                            let r = if matches!(op, Operand::Vector { .. }) {
-                                Reg::V(reg)
-                            } else {
-                                Reg::S(reg)
-                            };
-                            let val = inst.read(r).ok_or("an unread operand")?;
-                            match l.floats.get(&val) {
-                                Some(&f) => l.as_int(f),
-                                None => l.i32_of(val)?,
-                            }
-                        }
+                    let mut b = match (k, l.src0) {
+                        (0, Some(x)) => x,
                         _ => l.operand(inst, &op)?,
                     };
                     if v.abs >> k & 1 != 0 {
