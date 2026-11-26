@@ -337,12 +337,19 @@ impl Lower<'_> {
                 let pos = self.s.m.cmp(c, pred::OGE, ray.inv[a], zero);
                 let mut n = self.s.m.select(c, pos, tlo, thi);
                 let mut x = self.s.m.select(c, pos, thi, tlo);
-                // A ray in the plane (0 * inf) is not bounded by it.
+                // A ray in the plane is not bounded by it — but only the 0 *
+                // +-inf of an infinite inverse is the plane case; with a NaN
+                // inverse the NaN ends stay and the box misses, as in GPURT's
+                // fast_intersect_bbox (IntersectCommon.hlsl).
+                let pinf = self.s.m.cmp(c, pred::OEQ, ray.inv[a], inf);
+                let ninfv = self.s.m.cmp(c, pred::OEQ, ray.inv[a], ninf);
+                let infinite = self.s.m.bin(c, Bin::Or, pinf, ninfv);
                 for (t, d, open) in [(&mut n, [dlo, dhi], ninf), (&mut x, [dhi, dlo], inf)] {
                     let d = self.s.m.select(c, pos, d[0], d[1]);
                     let on = self.s.m.cmp(c, pred::OEQ, d, zero);
                     let undefined = self.s.m.cmp(c, pred::UNO, *t, *t);
                     let both = self.s.m.bin(c, Bin::And, on, undefined);
+                    let both = self.s.m.bin(c, Bin::And, both, infinite);
                     *t = self.s.m.select(c, both, open, *t);
                 }
                 for t in [n, x] {
