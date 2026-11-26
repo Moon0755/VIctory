@@ -1497,9 +1497,65 @@ fn cube_zero_and_denormals_match_rdna2_oracle() {
         }
     };
     assert_clean(check(&[
-        probe(vop3(0x145, 5, [v(1), v(2), v(3)], NONE), inputs.clone(), F32, expected(0)),
-        probe(vop3(0x146, 5, [v(1), v(2), v(3)], NONE), inputs.clone(), F32, expected(1)),
+        probe(vop3(0x145, 5, [v(1), v(2), v(3)], NONE), inputs.clone(), INT, expected(0)),
+        probe(vop3(0x146, 5, [v(1), v(2), v(3)], NONE), inputs.clone(), INT, expected(1)),
         probe(vop3(0x147, 5, [v(1), v(2), v(3)], NONE), inputs, F32, expected(2)),
+    ]));
+}
+
+/// The bit paths under input modifiers measured in AnyPS5's
+/// Vop3CubeClamp.cpp (rows 6, 7, 8 and 11, columns 9 and 10 of `Expected`,
+/// mode FLOAT_MODE=0xc0 IEEE=0): column 9 is `v_cubesc_f32 v19, |v4|, -v5, -v6`
+/// (abs on x, neg on y and z), column 10 `v_cubetc_f32 v20, -v4, -v5, |v6|`
+/// (neg on x and y, abs on z). The console keeps the denormal bits: the
+/// modifiers act on the bit pattern, so a denormal coordinate must reach
+/// the output bit for bit however the host rounds float abs/neg.
+#[test]
+fn cube_srcmod_bit_paths_match_rdna2_oracle() {
+    const CASES: &[([u32; 3], u32, u32)] = &[
+        ([0xff80_0000, 0x8000_0007, 0x0000_0007], 0x0000_0007, 0x8000_0007),
+        ([0x7fc0_0000, 0x0000_0007, 0xff80_0000], 0xff80_0000, 0x0000_0007),
+        ([0xbf00_0000, 0x0000_0000, 0x8000_0007], 0x8000_0007, 0x0000_0000),
+        ([0x0000_0007, 0x0000_0007, 0x8000_0007], 0x0000_0007, 0x0000_0007),
+    ];
+    let inputs: Vec<[u32; 4]> = CASES
+        .iter()
+        .map(|&([x, y, z], _, _)| [x, y, z, OLD])
+        .collect();
+    let expected = |col: usize| {
+        move |i: [u32; 4]| {
+            let (_, sc, tc) = CASES
+                .iter()
+                .copied()
+                .find(|&([x, y, z], _, _)| [x, y, z] == [i[0], i[1], i[2]])
+                .expect("known case");
+            vec![[sc, tc][col]]
+        }
+    };
+    // abs/neg bit k modifies source k: sc = abs x, neg y,z; tc = neg x,y, abs z.
+    let sc_mods = M {
+        abs: 1,
+        neg: 6,
+        ..NONE
+    };
+    let tc_mods = M {
+        abs: 4,
+        neg: 3,
+        ..NONE
+    };
+    assert_clean(check(&[
+        probe(
+            vop3(0x145, 5, [v(1), v(2), v(3)], sc_mods),
+            inputs.clone(),
+            INT,
+            expected(0),
+        ),
+        probe(
+            vop3(0x146, 5, [v(1), v(2), v(3)], tc_mods),
+            inputs,
+            INT,
+            expected(1),
+        ),
     ]));
 }
 
