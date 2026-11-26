@@ -258,3 +258,34 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         }
     }
 }
+
+/// shadps4-emu/shadPS4#5466's shape: the loop's scalar mask update sits
+/// between two vector instructions inside the `v_cmpx` scope (here the
+/// sample and a move), not at the scope's end. On the console the scalar
+/// unit runs it for the wave whatever EXEC holds; a lowering that applied
+/// it only for the scope's lanes would corrupt the remaining-lanes mask of
+/// a wave mixing two descriptors.
+#[test]
+fn a_scalar_update_between_vector_ops_in_a_v_cmpx_waterfall_serves_the_wave() {
+    use crate::resource::tests::cmpx_waterfall;
+    let mut words = cmpx_waterfall(false, false);
+    // After `s_andn2_b32 s21, s21, exec_lo` insert `v_mov_b32 v3, v3` (a
+    // vector instruction), so the scalar update is between the sample and
+    // the move; the loop-back branch then covers one more instruction.
+    let at = words
+        .iter()
+        .position(|&w| w == 0x8A15_7E15)
+        .expect("the mask update");
+    words.insert(at + 1, 0x7E06_0303);
+    let branch = words
+        .iter()
+        .position(|&w| w == 0xBF89_FFEF)
+        .expect("the loop-back branch");
+    words[branch] = 0xBF89_FFEE;
+    let shader = build(&words, false);
+    // Lanes below 16 hold the first descriptor, the others the second.
+    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
+    for (label, red) in sampled(&shader) {
+        assert_eq!(red, want, "{label}");
+    }
+}
