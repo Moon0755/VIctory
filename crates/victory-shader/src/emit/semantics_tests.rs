@@ -1269,6 +1269,48 @@ fn arithmetic_matches_the_hardware() {
     assert_clean(check(&passing(arithmetic_probes())));
 }
 
+/// RDNA2 hardware oracle check for `v_mul_f32` tininess detection with
+/// 32-bit denormals flushed: hardware detects tininess after rounding to 24
+/// significand bits with an unbounded exponent, so a product just below
+/// 2^-126 that rounds up to 2^-126 stays `0x0080_0000` (or `0x8080_0000`)
+/// instead of flushing to zero.
+///
+/// Expected values are single measured rows from RDNA2 hardware (gfx1036 and
+/// gfx1030, IEEE=0, DX10_CLAMP=1, denorm32=0, denorm16=3, RNE) recorded in
+/// `boykopovar/AnyPS5`: `F32DenormalFlush.cpp` (`TinyRows`/`TinyExpected`
+/// lanes 0, 1) and `F32ConstantFactorTininess.cpp` (commit `712a9cbcd9`,
+/// exact halfway tie `0x3f118e00 * 0x00e12000 = 2^-126 * (1 - 2^-25)`).
+#[test]
+fn mul_tininess_after_rounding_matches_rdna2_oracle() {
+    // Each row: (a, b, expected bits of v_mul_f32(a, b)).
+    const CASES: &[(u32, u32, u32)] = &[
+        // Tiny before rounding, rounds up to ±2^-126 -> kept on RDNA2.
+        (0x0080_0001, 0x3F7F_FFFE, 0x0080_0000),
+        (0x8080_0001, 0x3F7F_FFFE, 0x8080_0000),
+        // Exact tie halfway between max denormal and 2^-126 -> ties-to-even -> ±2^-126.
+        (0x3F11_8E00, 0x00E1_2000, 0x0080_0000),
+        (0xBF11_8E00, 0x00E1_2000, 0x8080_0000),
+        // Controls: still tiny after rounding -> flushed to ±0.0.
+        (0x0080_0000, 0x3F7F_FFFF, 0x0000_0000),
+        (0x8080_0000, 0x3F7F_FFFF, 0x8000_0000),
+        (0x3F11_8E00, 0x00E1_1FFF, 0x0000_0000),
+    ];
+    let inputs: Vec<[u32; 4]> = CASES.iter().map(|&(a, b, _)| [a, b, 0, OLD]).collect();
+    assert_clean(check(&[probe(
+        [vop2(0x08, 5, v(1), 2)],
+        inputs,
+        INT,
+        |i| {
+            let (_, _, want) = CASES
+                .iter()
+                .copied()
+                .find(|&(a, b, _)| [a, b] == [i[0], i[1]])
+                .expect("known case");
+            vec![want]
+        },
+    )]));
+}
+
 /// Minimum, maximum, median, and `v_max_f32 x, x clamp` (the title's
 /// saturate) with NaN, -0 and denormals.
 fn min_max_probes() -> Vec<Probe> {
