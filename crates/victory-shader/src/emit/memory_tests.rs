@@ -1051,10 +1051,30 @@ fn buffer_load_ushort_joins_bytes_across_dwords() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // Byte `i` of the copy is `i` (for `i < 256`).
-    let copy: Vec<u32> = (0..64u32)
+    // Byte `i` of the copy is `i` (for `i < 256`), except for ten bytes
+    // overwritten with the oracle's measured inputs below.
+    let mut copy: Vec<u32> = (0..64u32)
         .map(|k| (4 * k) | ((4 * k + 1) << 8) | ((4 * k + 2) << 16) | ((4 * k + 3) << 24))
         .collect();
+    // Measured on the console (AnyPS5 `BufferHalfStraddle.cpp`, commit
+    // d3335727b9 — only the measured numbers are taken): with source bytes
+    // 96 9d at byte offset 3 the load gives 9d96, b2 b9 at 7 gives b9b2,
+    // ce d5 at 11 gives d5ce, ea f1 at 15 gives f1ea, 06 0d at 19 gives
+    // 0d06. Those bytes land at the lanes 0..4 read positions.
+    for (byte, v) in [
+        (3usize, 0x96u32),
+        (4, 0x9d),
+        (7, 0xb2),
+        (8, 0xb9),
+        (11, 0xce),
+        (12, 0xd5),
+        (15, 0xea),
+        (16, 0xf1),
+        (19, 0x06),
+        (20, 0x0d),
+    ] {
+        copy[byte / 4] = (copy[byte / 4] & !(0xff << (8 * (byte % 4)))) | (v << (8 * (byte % 4)));
+    }
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -1087,9 +1107,12 @@ fn buffer_load_ushort_joins_bytes_across_dwords() {
         // Lane `l` reads at byte `4*l + 3`: the halfword is byte `4*l+3`
         // in its low byte and byte `4*l+4` — byte 0 of the next dword — in
         // its high byte.
-        let want: Vec<u32> = (0..32)
+        let mut want: Vec<u32> = (0..32)
             .map(|lane| (4 * lane + 3) | ((4 * lane + 4) << 8))
             .collect();
+        // Lanes 0..4: the oracle's measured results for the measured input
+        // bytes above, not the join rule alone.
+        want[..5].copy_from_slice(&[0x9d96, 0xb9b2, 0xd5ce, 0xf1ea, 0x0d06]);
         assert_eq!(out[0], want.as_slice(), "{label}");
         ran += 1;
     }

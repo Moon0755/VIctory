@@ -9746,8 +9746,6 @@ impl<'a> Lower<'a> {
         }
         if let Some((width, signed)) = sub {
             // The dword holding the field, as `global_load_ubyte` and kin.
-            // A half at byte 3 of it straddles into the next dword: its
-            // high byte is byte 0 there.
             if index.is_some() {
                 return Err("a byte or half buffer load by index");
             }
@@ -9755,18 +9753,10 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::And, off, not3);
             let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
             let c = self.cur;
-            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-            let dword = |l: &mut Self, at: V| -> Result<V, Why> {
-                let c = l.cur;
-                let r = l.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    l.s.t.res_ret,
-                    139,
-                    &[h, at, iu, mask, align],
-                );
-                let w = l.s.m.extract(c, r, 0);
+            let (mask, align, eight) = (self.s.m.i8(1), self.s.m.i32(4), self.s.m.i32(8));
+            let dword = |l: &mut Self, at: V| {
+                let r = l.s.op(l.cur, "rawBufferLoad.f32", Attr::ReadOnly, l.s.t.res_ret, 139, &[h, at, iu, mask, align]);
+                let w = l.s.m.extract(l.cur, r, 0);
                 Ok(l.as_int(w))
             };
             let w = dword(self, at)?;
@@ -9774,19 +9764,15 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let x = self.s.m.bin(c, Bin::LShr, w, sh);
             let x = if width == 16 {
-                // The next dword, re-reading this one when the half does not
-                // straddle, so nothing past it is read that the plain read
-                // would not read.
+                // A half at byte 3 straddles into the next dword; otherwise
+                // the second read re-reads this one and `x | x` is `x`.
                 let is3 = self.s.m.cmp(c, pred::EQ, byte, three);
-                let four = self.s.m.i32(4);
-                let next = self.s.m.bin(c, Bin::Add, at, four);
-                let second = self.s.m.select(c, is3, next, at);
-                let w1 = dword(self, second)?;
-                let (high, low) = (self.s.m.i32(24), self.s.m.i32(8));
-                let lo = self.s.m.bin(c, Bin::LShr, w, high);
-                let hi = self.s.m.bin(c, Bin::Shl, w1, low);
-                let joined = self.s.m.bin(c, Bin::Or, lo, hi);
-                self.s.m.select(c, is3, joined, x)
+                let next = self.s.m.bin(c, Bin::Add, at, align);
+                let next = self.s.m.select(c, is3, next, at);
+                let w1 = dword(self, next)?;
+                let hi = self.s.m.bin(c, Bin::Shl, w1, eight);
+                let hi = self.s.m.select(c, is3, hi, x);
+                self.s.m.bin(c, Bin::Or, x, hi)
             } else {
                 x
             };
