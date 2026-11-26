@@ -924,3 +924,157 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+const fn s_load_with_soffset(op: u32, sdata: u8, sbase: u8, offset: u32, soffset: u8) -> [u32; 2] {
+    [
+        0x3D << 26 | op << 18 | (sdata as u32) << 6 | (sbase as u32 >> 1),
+        (soffset as u32) << 25 | offset,
+    ]
+}
+
+fn scalar_load_alignment_program() -> HostShader {
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0));
+    w.push(s_mov_b32(14, 130));
+    w.extend(s_load(0, 20, 0, 3));
+    w.extend(s_load_with_soffset(0, 21, 2, 6, 14));
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(1, 20));
+    w.push(v_mov_b32(2, 21));
+    w.extend(buffer_store_dword(1, 8, 0));
+    w.extend(buffer_store_dword(2, 8, 4));
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.memory);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    shader
+}
+
+#[test]
+fn scalar_loads_truncate_address_terms_to_dwords_independently() {
+    let shader = scalar_load_alignment_program();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut memory = vec![0u32; 64];
+    memory[..3].copy_from_slice(&[0xA110_0000, 0xA110_0001, 0xA110_0002]);
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let unaligned = TITLE + 1;
+        let constants = [
+            unaligned as u32,
+            (unaligned >> 32) as u32,
+            TITLE as u32,
+            (TITLE >> 32) as u32,
+        ];
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => constants[u.dword as usize],
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(2),
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[0], [0xA110_0000, 0xA110_0001], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
