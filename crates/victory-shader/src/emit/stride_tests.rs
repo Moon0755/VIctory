@@ -744,3 +744,112 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         }
     }
 }
+
+const fn s_mov_literal(sdst: u8, value: u32) -> [u32; 2] {
+    [0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | 0xFF, value]
+}
+
+/// SMEM `s_buffer_load_dword*` at `s[base:base+3]` with a null SGPR offset.
+const fn s_buffer_load(op: u32, sdata: u8, base: u8, offset: u32) -> [u32; 2] {
+    [
+        0xF400_0000 | op << 18 | (sdata as u32) << 6 | (base as u32) >> 1,
+        125 << 25 | offset,
+    ]
+}
+
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offset:byte_off`.
+const fn buffer_store_at(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0xE070_0000 | byte_off,
+        0x8000_0000 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// A constant table read through a V# built around `s_getpc_b64`: a dword
+/// inside NUM_RECORDS reads the table, a dword past it reads zero, and a wide
+/// load zeroes only its own out-of-range dword.
+fn code_table_bounds_program() -> Vec<u32> {
+    let mut w = vec![
+        0xBE84_1F00, // s_getpc_b64 s[4:5]
+        0x8008_FF04, // s_add_u32 s8, s4, <table start - 4>
+        0,           // literal patched below
+        0xBE89_0305, // s_mov_b32 s9, s5 (the descriptor's dword 1: high base, stride 0)
+    ];
+    w.extend(s_mov_literal(10, 12)); // NUM_RECORDS = 12 bytes
+    w.extend(s_mov_literal(11, 0x3101_6FAC));
+    w.extend(s_buffer_load(8, 16, 8, 0)); // s16 = in range, offset 0
+    w.extend(s_buffer_load(8, 17, 8, 12)); // s17 = past NUM_RECORDS
+    w.extend(s_buffer_load(9, 18, 8, 8)); // s18 in range, s19 past it
+    w.push(0xBE94_0302); // s_mov_b32 s20, s2
+    w.push(0xBE95_0380); // s_mov_b32 s21, 0
+    w.extend([0xF408_060A, 0xFA00_0000]); // s_load_dwordx4 s[24:27], s[20:21], 0
+    w.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    w.push(0x7E00_0280); // v_mov_b32 v0, 0
+    w.extend([0x7E02_0210, 0x7E04_0211, 0x7E06_0212, 0x7E08_0213]); // v1..v4 = s16..s19
+    for (data, at) in [(1, 0), (2, 4), (3, 8), (4, 12)] {
+        w.extend(buffer_store_at(data, 0, 24, at));
+    }
+    w.push(0xBF81_0000); // s_endpgm
+    let table_start = 4 * w.len() as u32;
+    w[2] = table_start - 4; // s_getpc_b64 yields the byte after itself.
+    w.extend([
+        0xC0DE_0000,
+        0xC0DE_0001,
+        0xC0DE_0002,
+        0xC0DE_0003,
+        0xC0DE_0004,
+        0xC0DE_0005,
+    ]);
+    w
+}
+
+#[test]
+fn scalar_buffer_loads_of_a_code_table_read_zero_past_num_records() {
+    let words = code_table_bounds_program();
+    let shader = build(
+        &words,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let views = [View::RawUav(32)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(
+            out[0][..4],
+            [0xC0DE_0000, 0, 0xC0DE_0002, 0],
+            "{label}: in-range dword, out-of-range dword, wide load"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
