@@ -2827,7 +2827,18 @@ impl<'a> Lower<'a> {
             }
         }
         if v.clamp {
-            f = self.unary(7, f);
+            // DX10_CLAMP: positive values up to +inf clamp to [0, 1] keeping
+            // positive denormal bits; -0, negative values, and NaNs give +0.
+            let c = self.cur;
+            let x = self.as_int(f);
+            let inf = self.s.m.i32(0x7F80_0000);
+            let one = self.s.m.i32(0x3F80_0000);
+            let zero = self.s.m.i32(0);
+            let pos = self.s.m.cmp(c, pred::IULE, x, inf);
+            let over = self.s.m.cmp(c, pred::IUGT, x, one);
+            let clamped = self.s.m.select(c, over, one, x);
+            let res = self.s.m.select(c, pos, clamped, zero);
+            f = self.as_float(res);
         }
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
