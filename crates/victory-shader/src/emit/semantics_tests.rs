@@ -1322,11 +1322,14 @@ fn min_max_and_clamp_match_the_hardware() {
 
 /// `v_cubeid_f32`, `v_cubesc_f32`, `v_cubetc_f32` and `v_cubema_f32` of
 /// (x, y, z) (RDNA2 ISA: the major axis is z when |z| >= |x| and |z| >= |y|,
-/// else y when |y| >= |x|, else x), with the coordinates' denormals read as
-/// zeros of their sign.
+/// else y when |y| >= |x|, else x): denormal coordinates read as +0/-0 for
+/// axis/sign selection, `v_cubesc_f32`/`v_cubetc_f32` return the chosen raw
+/// operand bits (flipping the sign bit when negated), and `v_cubema_f32`
+/// returns +0 for a zero or denormal major axis (measured on RDNA2,
+/// gfx1035/gfx1036, AnyPS5 hardware oracle).
 fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
-    let (x, y, z) = (ftz(x), ftz(y), ftz(z));
-    let (ax, ay, az) = (fl(x).abs(), fl(y).abs(), fl(z).abs());
+    let (fx, fy, fz) = (ftz(x), ftz(y), ftz(z));
+    let (ax, ay, az) = (fl(fx).abs(), fl(fy).abs(), fl(fz).abs());
     let zmaj = az >= ax && az >= ay;
     let ymaj = ay >= ax;
     let neg = |v: u32| fl(v) < 0.0;
@@ -1343,19 +1346,26 @@ fn cube(op: u16, x: u32, y: u32, z: u32) -> u32 {
     match op {
         0x144 => {
             let id = pick(
-                if neg(z) { 5 } else { 4 },
-                if neg(y) { 3 } else { 2 },
-                u32::from(neg(x)),
+                if neg(fz) { 5 } else { 4 },
+                if neg(fy) { 3 } else { 2 },
+                u32::from(neg(fx)),
             );
             (id as f32).to_bits()
         }
         0x145 => pick(
-            if neg(z) { minus(x) } else { x },
+            if neg(fz) { minus(x) } else { x },
             x,
-            if neg(x) { z } else { minus(z) },
+            if neg(fx) { z } else { minus(z) },
         ),
-        0x146 => pick(minus(y), if neg(y) { minus(z) } else { z }, minus(y)),
-        _ => out(fl(pick(z, y, x)) * 2.0),
+        0x146 => pick(minus(y), if neg(fy) { minus(z) } else { z }, minus(y)),
+        _ => {
+            let maj = pick(fz, fy, fx);
+            if maj & 0x7FFF_FFFF == 0 {
+                0
+            } else {
+                out(fl(maj) * 2.0)
+            }
+        }
     }
 }
 
@@ -1378,6 +1388,268 @@ fn cube_probes() -> Vec<Probe> {
 #[test]
 fn cube_faces_match_the_hardware() {
     assert_clean(check(&cube_probes()));
+}
+
+/// When z is the major axis, SC selects x. Only the negative-z face flips
+/// its sign; the subnormal payload must survive either choice.
+#[test]
+fn cube_sc_keeps_subnormal_x_on_both_z_faces() {
+    let inputs = [0x0000_0001, 0x8000_0001, 0x007f_ffff, 0x807f_ffff]
+        .into_iter()
+        .flat_map(|x| [0x3f80_0000, 0xbf80_0000].map(|z| [x, 0, z, OLD]))
+        .collect();
+    assert_clean(check(&[probe(
+        vop3(0x145, 5, [v(1), v(2), v(3)], NONE),
+        inputs,
+        INT,
+        |[x, _, z, _]| vec![x ^ (z & 0x8000_0000)],
+    )]));
+}
+
+/// RDNA2 hardware oracle check for `v_cubesc_f32`, `v_cubetc_f32` and
+/// `v_cubema_f32` on signed zeros and denormal coordinates: `v_cubesc_f32` and
+/// `v_cubetc_f32` preserve subnormal coordinate bits (flipping only the sign
+/// bit when negating), while `v_cubema_f32` returns +0 for a -0 or negative
+/// denormal major axis.
+///
+/// Expected values are single measured rows from RDNA2 hardware (gfx1035 and
+/// gfx1036, IEEE=0, DX10_CLAMP=1, denorm32=0, denorm16=3, RNE) recorded in
+/// `boykopovar/AnyPS5`, `core/libs/prx/libSceAgcDriver/tests/execution/Vop3CubeClamp.cpp`
+/// (commits `f457d87bbd` and `e32f5e161d`, `Rows` / `Expected` lanes 0, 4, 6,
+/// 7, 8, 11 and 27).
+#[test]
+fn cube_zero_and_denormals_match_rdna2_oracle() {
+    // Each row: (x, y, z, expected cubesc, expected cubetc, expected cubema).
+    const CASES: &[(u32, u32, u32, u32, u32, u32)] = &[
+        // Lane 0: (-0, -0, -0) -> cubema is +0 (not -0).
+        (
+            0x8000_0000,
+            0x8000_0000,
+            0x8000_0000,
+            0x8000_0000,
+            0x0000_0000,
+            0x0000_0000,
+        ),
+        // Lane 27: (+0, +0, -0) -> cubema is +0 (not -0).
+        (
+            0x0000_0000,
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0000,
+            0x8000_0000,
+            0x0000_0000,
+        ),
+        // Lane 4: (-denorm(7), qNaN, qNaN) -> cubema flushes to +0.
+        (
+            0x8000_0007,
+            0x7FC0_0000,
+            0x7FC0_0000,
+            0xFFC0_0000,
+            0xFFC0_0000,
+            0x0000_0000,
+        ),
+        // Lane 6: (-inf, -denorm(7), +denorm(7)) -> cubesc/cubetc keep denormal bits.
+        (
+            0xFF80_0000,
+            0x8000_0007,
+            0x0000_0007,
+            0x0000_0007,
+            0x0000_0007,
+            0xFF80_0000,
+        ),
+        // Lane 7: (qNaN, +denorm(7), -inf) -> cubetc keeps negated denormal bits.
+        (
+            0x7FC0_0000,
+            0x0000_0007,
+            0xFF80_0000,
+            0x7F80_0000,
+            0x8000_0007,
+            0x7FC0_0000,
+        ),
+        // Lane 8: (-0.5, +0, -denorm(7)) -> cubesc keeps denormal bits.
+        (
+            0xBF00_0000,
+            0x0000_0000,
+            0x8000_0007,
+            0x8000_0007,
+            0x8000_0000,
+            0xBF80_0000,
+        ),
+        // Lane 11: (+denorm(7), +denorm(7), -denorm(7)) -> cubesc/cubetc keep bits, cubema +0.
+        (
+            0x0000_0007,
+            0x0000_0007,
+            0x8000_0007,
+            0x0000_0007,
+            0x8000_0007,
+            0x0000_0000,
+        ),
+    ];
+    let inputs: Vec<[u32; 4]> = CASES
+        .iter()
+        .map(|&(x, y, z, _, _, _)| [x, y, z, OLD])
+        .collect();
+    let expected = |col: usize| {
+        move |i: [u32; 4]| {
+            let (_, _, _, sc, tc, ma) = CASES
+                .iter()
+                .copied()
+                .find(|&(x, y, z, _, _, _)| [x, y, z] == [i[0], i[1], i[2]])
+                .expect("known case");
+            vec![[sc, tc, ma][col]]
+        }
+    };
+    assert_clean(check(&[
+        probe(
+            vop3(0x145, 5, [v(1), v(2), v(3)], NONE),
+            inputs.clone(),
+            INT,
+            expected(0),
+        ),
+        probe(
+            vop3(0x146, 5, [v(1), v(2), v(3)], NONE),
+            inputs.clone(),
+            INT,
+            expected(1),
+        ),
+        probe(
+            vop3(0x147, 5, [v(1), v(2), v(3)], NONE),
+            inputs,
+            F32,
+            expected(2),
+        ),
+    ]));
+}
+
+/// The bit paths under input modifiers measured in AnyPS5's
+/// Vop3CubeClamp.cpp (rows 6, 7, 8 and 11, columns 9 and 10 of `Expected`,
+/// mode FLOAT_MODE=0xc0 IEEE=0): column 9 is `v_cubesc_f32 v19, |v4|, -v5, -v6`
+/// (abs on x, neg on y and z), column 10 `v_cubetc_f32 v20, -v4, -v5, |v6|`
+/// (neg on x and y, abs on z). The console keeps the denormal bits: the
+/// modifiers act on the bit pattern, so a denormal coordinate must reach
+/// the output bit for bit however the host rounds float abs/neg.
+#[test]
+fn cube_srcmod_bit_paths_match_rdna2_oracle() {
+    const CASES: &[([u32; 3], u32, u32)] = &[
+        (
+            [0xff80_0000, 0x8000_0007, 0x0000_0007],
+            0x0000_0007,
+            0x8000_0007,
+        ),
+        (
+            [0x7fc0_0000, 0x0000_0007, 0xff80_0000],
+            0xff80_0000,
+            0x0000_0007,
+        ),
+        (
+            [0xbf00_0000, 0x0000_0000, 0x8000_0007],
+            0x8000_0007,
+            0x0000_0000,
+        ),
+        (
+            [0x0000_0007, 0x0000_0007, 0x8000_0007],
+            0x0000_0007,
+            0x0000_0007,
+        ),
+    ];
+    let inputs: Vec<[u32; 4]> = CASES
+        .iter()
+        .map(|&([x, y, z], _, _)| [x, y, z, OLD])
+        .collect();
+    let expected = |col: usize| {
+        move |i: [u32; 4]| {
+            let (_, sc, tc) = CASES
+                .iter()
+                .copied()
+                .find(|&([x, y, z], _, _)| [x, y, z] == [i[0], i[1], i[2]])
+                .expect("known case");
+            vec![[sc, tc][col]]
+        }
+    };
+    // abs/neg bit k modifies source k: sc = abs x, neg y,z; tc = neg x,y, abs z.
+    let sc_mods = M {
+        abs: 1,
+        neg: 6,
+        ..NONE
+    };
+    let tc_mods = M {
+        abs: 4,
+        neg: 3,
+        ..NONE
+    };
+    assert_clean(check(&[
+        probe(
+            vop3(0x145, 5, [v(1), v(2), v(3)], sc_mods),
+            inputs.clone(),
+            INT,
+            expected(0),
+        ),
+        probe(
+            vop3(0x146, 5, [v(1), v(2), v(3)], tc_mods),
+            inputs,
+            INT,
+            expected(1),
+        ),
+    ]));
+}
+
+/// The clamped column `v_cubesc_f32 v23, v4, -v5, |v6| clamp` of AnyPS5's
+/// Vop3CubeClamp.cpp (rows 6, 8 and 11 of `Expected`, column 13, mode
+/// FLOAT_MODE=0xc0 IEEE=0): under abs on z a NEGATIVE denormal z is selected
+/// (in row 8 through the negative x axis) and reaches the output as a
+/// positive denormal, which clamp keeps — no other probe selects a negative
+/// denormal with abs on.
+#[test]
+fn clamped_cube_abs_of_negative_denormal_matches_rdna2_oracle() {
+    const CASES: &[[u32; 3]] = &[
+        [0xff80_0000, 0x8000_0007, 0x0000_0007],
+        [0xbf00_0000, 0x0000_0000, 0x8000_0007],
+        [0x0000_0007, 0x0000_0007, 0x8000_0007],
+    ];
+    let inputs: Vec<[u32; 4]> = CASES.iter().map(|&[x, y, z]| [x, y, z, OLD]).collect();
+    // clamp, abs on z (bit 2), neg on y (bit 1).
+    let mods = M {
+        abs: 4,
+        neg: 2,
+        clamp: true,
+        ..NONE
+    };
+    assert_clean(check(&[probe(
+        vop3(0x145, 5, [v(1), v(2), v(3)], mods),
+        inputs,
+        INT,
+        |_| vec![7],
+    )]));
+}
+
+/// The clamped SC/TC outputs measured in AnyPS5's Vop3CubeClamp.cpp
+/// (f457d87b, rows 6, 7, 8, 11 and 16), with no output multiplier.
+#[test]
+fn clamped_cube_coordinates_match_rdna2_oracle() {
+    const CASES: [([u32; 3], [u32; 2]); 5] = [
+        ([0xff80_0000, 0x8000_0007, 0x0000_0007], [7, 7]),
+        ([0x7fc0_0000, 0x0000_0007, 0xff80_0000], [0x3f80_0000, 0]),
+        ([0xbf00_0000, 0, 0x8000_0007], [0, 0]),
+        ([7, 7, 0x8000_0007], [7, 0]),
+        ([0xbf00_0000, 0xbf00_0000, 0x3f00_0000], [0, 0x3f00_0000]),
+    ];
+    let inputs: Vec<_> = CASES.iter().map(|&([x, y, z], _)| [x, y, z, OLD]).collect();
+    let probes = [0x145, 0x146].map(|op| {
+        let clamp = M {
+            clamp: true,
+            ..NONE
+        };
+        probe(
+            vop3(op, 5, [v(1), v(2), v(3)], clamp),
+            inputs.clone(),
+            INT,
+            move |[x, y, z, _]| {
+                let (_, output) = CASES.iter().find(|(xyz, _)| *xyz == [x, y, z]).unwrap();
+                vec![output[usize::from(op - 0x145)]]
+            },
+        )
+    });
+    assert_clean(check(&probes));
 }
 
 /// The 16 float predicates of `v_cmp_*_f32` (RDNA2 ISA: `o` ordered, `u`
