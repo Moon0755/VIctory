@@ -1487,6 +1487,98 @@ fn cube_zero_and_denormals_match_rdna2_oracle() {
     ]));
 }
 
+/// RDNA2 hardware oracle check for the `clamp` output modifier (`DX10_CLAMP=1`,
+/// `IEEE=0`, 32-bit denormals flushed, RNE) without zero-sign tolerance (`F32`):
+/// (a) scalar-to-f32 `v_add_f32_e64` and `v_mul_f32_e64` with `clamp` map -0
+/// and NaN to +0, negative values to +0, and values > 1 to 1.0;
+/// (b) `v_cubesc_f32` and `v_cubetc_f32` with `clamp` preserve positive
+/// denormal results while flushing -0 and negative denormal results to +0.
+///
+/// Expected values are single measured rows from RDNA2 hardware (gfx1030,
+/// gfx1035, and gfx1036) recorded in `boykopovar/AnyPS5`:
+/// - `core/libs/prx/libSceAgcDriver/tests/execution/F32ResultClamp.cpp`
+///   (commits `1233dd815d` and `75546230a6`, lanes 1, 4, 5, 7, 8, and 14)
+/// - `core/libs/prx/libSceAgcDriver/tests/execution/Dx10Clamp.cpp`
+///   (commit `f04ce007b6`, `ExpectedDx10` lanes 12 and 15)
+/// - `core/libs/prx/libSceAgcDriver/tests/execution/Vop3CubeClamp.cpp`
+///   (commits `f457d87bbd` and `e32f5e161d`, `Expected` lanes 0, 6, 7, 8, 9,
+///   11, 13, and 27).
+#[test]
+fn f32_clamp_zero_and_denormals_match_rdna2_oracle() {
+    let clamp = M {
+        clamp: true,
+        ..NONE
+    };
+    // Part (a): (src0, src1, expected v_add_f32 clamp, expected v_mul_f32 clamp).
+    const ARITH_CASES: &[(u32, u32, u32, u32)] = &[
+        // F32ResultClamp lane 14: -0 + -0 = -0 -> clamp +0; -0 * -0 = +0.
+        (0x8000_0000, 0x8000_0000, 0x0000_0000, 0x0000_0000),
+        // F32ResultClamp lane 8: -0 + +0 = +0; -0 * +0 = -0 -> clamp +0.
+        (0x8000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000),
+        // F32ResultClamp lane 1: +inf + -0 = +inf -> 1.0; +inf * -0 = NaN -> +0.
+        (0x7F80_0000, 0x8000_0000, 0x3F80_0000, 0x0000_0000),
+        // F32ResultClamp lane 7: qNaN -> +0.
+        (0x7FC0_0000, 0x7FC0_0000, 0x0000_0000, 0x0000_0000),
+        // F32ResultClamp lane 4: 1.5 -> 1.0; 0.5 -> 0.5.
+        (0x3F80_0000, 0x3F00_0000, 0x3F80_0000, 0x3F00_0000),
+        // F32ResultClamp lane 5: -2.5 -> +0; -2.5 * +0 = -0 -> +0.
+        (0xC020_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000),
+        // Dx10Clamp lane 12: -0 + 1.0 = 1.0; -0 * 1.0 = -0 -> +0.
+        (0x8000_0000, 0x3F80_0000, 0x3F80_0000, 0x0000_0000),
+        // Dx10Clamp lane 15: 1+1ulp -> 1.0; (1+1ulp) * -0 = -0 -> +0.
+        (0x3F80_0001, 0x8000_0000, 0x3F80_0000, 0x0000_0000),
+    ];
+    let arith_inputs: Vec<[u32; 4]> = ARITH_CASES.iter().map(|&(a, b, _, _)| [a, b, 0, OLD]).collect();
+    let arith_expected = |col: usize| {
+        move |i: [u32; 4]| {
+            let (_, _, add_out, mul_out) = ARITH_CASES
+                .iter()
+                .copied()
+                .find(|&(a, b, _, _)| [a, b] == [i[0], i[1]])
+                .expect("known arithmetic clamp case");
+            vec![[add_out, mul_out][col]]
+        }
+    };
+
+    // Part (b): (x, y, z, expected v_cubesc_f32 clamp, expected v_cubetc_f32 clamp).
+    const CUBE_CASES: &[(u32, u32, u32, u32, u32)] = &[
+        // Lane 0: sc -0 -> +0, tc +0 -> +0.
+        (0x8000_0000, 0x8000_0000, 0x8000_0000, 0x0000_0000, 0x0000_0000),
+        // Lane 6: +denorm(7) preserved by clamp.
+        (0xFF80_0000, 0x8000_0007, 0x0000_0007, 0x0000_0007, 0x0000_0007),
+        // Lane 7: sc +inf -> 1.0, tc -denorm(7) -> +0.
+        (0x7FC0_0000, 0x0000_0007, 0xFF80_0000, 0x3F80_0000, 0x0000_0000),
+        // Lane 8: sc -denorm(7) -> +0, tc -0 -> +0.
+        (0xBF00_0000, 0x0000_0000, 0x8000_0007, 0x0000_0000, 0x0000_0000),
+        // Lane 9: sc +denorm(7) preserved, tc sNaN -> +0.
+        (0x0000_0007, 0x0000_0007, 0x7F80_0001, 0x0000_0007, 0x0000_0000),
+        // Lane 11: sc +denorm(7) preserved, tc -denorm(7) -> +0.
+        (0x0000_0007, 0x0000_0007, 0x8000_0007, 0x0000_0007, 0x0000_0000),
+        // Lane 13: sc -2.0 -> +0, tc 2.5 -> 1.0.
+        (0x4000_0000, 0xC020_0000, 0xC020_0000, 0x0000_0000, 0x3F80_0000),
+        // Lane 27: tc -0 -> +0.
+        (0x0000_0000, 0x0000_0000, 0x8000_0000, 0x0000_0000, 0x0000_0000),
+    ];
+    let cube_inputs: Vec<[u32; 4]> = CUBE_CASES.iter().map(|&(x, y, z, _, _)| [x, y, z, OLD]).collect();
+    let cube_expected = |col: usize| {
+        move |i: [u32; 4]| {
+            let (_, _, _, sc, tc) = CUBE_CASES
+                .iter()
+                .copied()
+                .find(|&(x, y, z, _, _)| [x, y, z] == [i[0], i[1], i[2]])
+                .expect("known cube clamp case");
+            vec![[sc, tc][col]]
+        }
+    };
+
+    assert_clean(check(&[
+        probe(vop3(0x103, 5, [v(1), v(2), 0], clamp), arith_inputs.clone(), F32, arith_expected(0)),
+        probe(vop3(0x108, 5, [v(1), v(2), 0], clamp), arith_inputs, F32, arith_expected(1)),
+        probe(vop3(0x145, 5, [v(1), v(2), v(3)], clamp), cube_inputs.clone(), F32, cube_expected(0)),
+        probe(vop3(0x146, 5, [v(1), v(2), v(3)], clamp), cube_inputs, F32, cube_expected(1)),
+    ]));
+}
+
 /// The 16 float predicates of `v_cmp_*_f32` (RDNA2 ISA: `o` ordered, `u`
 /// unordered, `n*` true when unordered).
 fn compare(op: u16, a: u32, b: u32) -> bool {
