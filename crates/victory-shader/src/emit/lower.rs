@@ -4146,21 +4146,57 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
+        let imm_offset = *offset as u32;
+        let offset = &(imm_offset.wrapping_add(base) as i32);
         let mut addr = self.s.m.i32(*offset as u32);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            let so = self.operand(inst, soffset)?;
+        let so = if matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            None
+        } else {
+            Some(self.operand(inst, soffset)?)
+        };
+        if let Some(so) = so {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
-        if matches!(src, Source::Built { address, .. } if address.param == CODE) {
-            // A descriptor built around a table in the code.
+        if let Source::Built {
+            address,
+            bits,
+            words,
+        } = src
+            && address.param == CODE
+        {
+            // A descriptor built around a table in the code. Scalar buffer
+            // loads keep the resource's NUM_RECORDS bound per dword: the limit
+            // is in bytes for stride 0, in units of stride otherwise. The
+            // immediate and SGPR offsets are independent terms of that bound
+            // (the descriptor's base is not), each first truncated to a dword.
+            let stride = u64::from((bits >> 16) & 0x3FFF);
+            let limit = if stride == 0 {
+                u64::from(words[0])
+            } else {
+                u64::from(words[0]) * stride
+            };
+            self.s.flags |= flags::INT64;
+            let i64t = self.s.m.int(64);
+            let mut bound = self.s.m.int_const(i64t, i64::from(imm_offset & !3));
+            if let Some(so) = so {
+                let mask = self.s.m.i32(!3);
+                let aligned = self.s.m.bin(c, Bin::And, so, mask);
+                let aligned = self.s.m.cast(c, Cast::ZExt, aligned, i64t);
+                bound = self.s.m.bin(c, Bin::Add, bound, aligned);
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let x = self.code_dword(a)?;
+                let end = self.s.m.int_const(i64t, 4 * i64::from(k) + 4);
+                let end = self.s.m.bin(c, Bin::Add, bound, end);
+                let limit = self.s.m.int_const(i64t, limit as i64);
+                let out = self.s.m.cmp(c, pred::IUGT, end, limit);
+                let zero = self.s.m.i32(0);
+                let x = self.s.m.select(c, out, zero, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
