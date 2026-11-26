@@ -1462,10 +1462,11 @@ fn compares_match_the_hardware() {
     assert_clean(check(&compare_probes()));
 }
 
-/// Compares of denormal operands: whether the hardware flushes them first
-/// is fixed by no public source; the two adapters must at least agree.
+/// Compares of denormal operands in the console's float mode: f32
+/// denormals read as zeros of their signs (measured on RDNA2 gfx1036 by
+/// the AnyPS5 project, `VCmpF32Denormals.cpp`).
 #[test]
-fn compares_of_denormals_agree_across_adapters() {
+fn compares_of_denormals_match_the_hardware() {
     let denormals = [0x0000_0001, 0x8000_0001, 0x007F_FFFF, 0x807F_FFFF];
     let others = [
         0x0000_0000,
@@ -1477,15 +1478,12 @@ fn compares_of_denormals_agree_across_adapters() {
     ];
     let mut inputs = pairs(&denormals, &others);
     inputs.extend(pairs(&others, &denormals));
-    let p: Vec<Probe> = [0x1u16, 0x2, 0x3, 0xD]
+    let p: Vec<Probe> = [0x1u16, 0x2, 0x3, 0x4, 0x5, 0x6, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE]
         .into_iter()
-        .map(|op| Probe {
-            body: with_vcc(vopc(op, v(1), 2)),
-            scalar: false,
-            inputs: inputs.clone(),
-            model: None,
-            kind: INT,
-            defects: Vec::new(),
+        .map(|op| {
+            probe(with_vcc(vopc(op, v(1), 2)), inputs.clone(), INT, move |i| {
+                vec![u32::from(compare(op, ftz(i[0]), ftz(i[1])))]
+            })
         })
         .collect();
     assert_clean(check(&p));
