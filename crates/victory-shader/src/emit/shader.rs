@@ -1153,6 +1153,8 @@ mod tests {
             run();
         }
         eprintln!("shader::op 4096x: {:.1} us/run", t.elapsed().as_secs_f64() * 1e6 / 50.0);
+    }
+
     /// Live raw and typed heap atomics require different features, and
     /// both still write the full 64-bit value when run on the host.
     #[test]
