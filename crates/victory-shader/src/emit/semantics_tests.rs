@@ -1380,6 +1380,193 @@ fn cube_faces_match_the_hardware() {
     assert_clean(check(&cube_probes()));
 }
 
+// ---- division helpers against the console oracle ----
+
+const DIV_SCALE_ROWS: &[([u32; 4], u32, u32)] = &[
+    // Division.cpp:50
+    ([0x205765cf, 0xd03cee5e, 0x205765cf, 0], 0x405765cf, 1),
+    // Division.cpp:52
+    ([0x00ef1dbe, 0x00ef1dbe, 0xbf800000, 1], 0x20ef1dbe, 1),
+    // Division.cpp:58
+    ([0xbf6e2b6e, 0xbf6e2b6e, 0x3fd849f1, 1], 0xbf6e2b6e, 0),
+    // Division.cpp:102
+    ([0x1e5b0043, 0x00800000, 0x1e5b0043, 0], 0x1e5b0043, 0),
+    // Division.cpp:153
+    ([0x0082f0ee, 0x00000000, 0x0082f0ee, 0], 0xffc00000, 0),
+    // Division.cpp:283
+    ([0x00000000, 0x0082f0ee, 0x00000000, 0], 0xffc00000, 0),
+    // Division.cpp:229
+    ([0xff800000, 0x80dba64c, 0xff800000, 0], 0xff800000, 1),
+    // Division.cpp:263
+    ([0x7f7fffff, 0x00f745cf, 0x7f7fffff, 0], 0x7f7fffff, 1),
+    // Division.cpp:232
+    ([0x00d2a4bc, 0x00d2a4bc, 0x00800000, 1], 0x20d2a4bc, 0),
+    // Division.cpp:57
+    ([0x00d2a4bc, 0x00800000, 0x00d2a4bc, 0], 0x20d2a4bc, 0),
+    // Division.cpp:271
+    ([0x00800000, 0x00d2a4bc, 0x00800000, 0], 0x20800000, 0),
+    // Division.cpp:90
+    ([0x7f236db9, 0x7f236db9, 0x80000000, 1], 0xffc00000, 1),
+    // Division.cpp:281
+    ([0x00800000, 0xff44e998, 0x00800000, 0], 0x00800000, 1),
+    // Division.cpp:294
+    ([0x7f800000, 0x7f800000, 0x64367202, 1], 0x7f800000, 0),
+    // Division.cpp:65
+    ([0xff44e998, 0x00800000, 0xff44e998, 0], 0xff44e998, 1),
+    // Division.cpp:192
+    ([0x80000000, 0xff432955, 0x80000000, 0], 0xffc00000, 1),
+    // Division.cpp:301
+    ([0x8087bc0a, 0x7f800000, 0x8087bc0a, 0], 0x8087bc0a, 1),
+    // Division.cpp:128
+    ([0x3fbfb16f, 0x7f800000, 0x3fbfb16f, 0], 0x3fbfb16f, 1),
+    // Division.cpp:208
+    ([0x1e52f93a, 0xff800000, 0x1e52f93a, 0], 0x1e52f93a, 1),
+    // Division.cpp:76
+    ([0x646a79cc, 0x646a79cc, 0x34012ffc, 0], 0x646a79cc, 1),
+];
+
+const DIV_FMAS_ROWS: &[([u32; 4], u32, u32)] = &[
+    // Division.cpp:49
+    ([0x6447899f, 0xdf6dabe5, 0x407fa3f9, 1], 0xff800000, 4286578688),
+    // Division.cpp:50
+    ([0x205765cf, 0xd03cee5e, 0x205765cf, 0], 0xb11ef754, 2971596628),
+    // Division.cpp:51
+    ([0xe46366ba, 0xb26bd3d1, 0xe46366ba, 0], 0xe46366ba, 3831719610),
+    // Division.cpp:52
+    ([0x00ef1dbe, 0x00ef1dbe, 0xbf800000, 1], 0x9f800000, 2675965952),
+    // Division.cpp:55
+    ([0x8f7fdc41, 0x8f7fdc41, 0xc12da640, 1], 0xe12da640, 3777865280),
+    // Division.cpp:60
+    ([0x9e5afe34, 0x9e5afe34, 0x7f7fffff, 1], 0x7f800000, 2139095040),
+    // Division.cpp:76
+    ([0x646a79cc, 0x646a79cc, 0x34012ffc, 0], 0x7f800000, 2139095040),
+    // Division.cpp:118
+    ([0x0c98e836, 0x3faf6061, 0x0c98e836, 1], 0x00000000, 0),
+    // Division.cpp:120
+    ([0xff44e998, 0xff44e998, 0x00800000, 1], 0x7f800000, 2139095040),
+    // Division.cpp:152
+    ([0x0cd303a0, 0x3ff8566f, 0x0cd303a0, 1], 0x00000000, 0),
+    // Division.cpp:164
+    ([0x8c212161, 0xbffb2a03, 0x8c212161, 1], 0x00000000, 0),
+    // Division.cpp:184
+    ([0xb26ef1d1, 0xfee6b9ef, 0xb26ef1d1, 1], 0x51d75ace, 1373067982),
+    // Division.cpp:227
+    ([0xff800000, 0xff800000, 0x1e52f93a, 1], 0x7f800000, 2139095040),
+    // Division.cpp:231
+    ([0xfee6b9ef, 0xfee6b9ef, 0xb26ef1d1, 1], 0x7f800000, 2139095040),
+    // Division.cpp:236
+    ([0x3fe06be1, 0x5f158c37, 0x4040cd86, 1], 0x7f800000, 2139095040),
+    // Division.cpp:263
+    ([0x7f7fffff, 0x00f745cf, 0x7f7fffff, 0], 0x7f7fffff, 2139095039),
+    // Division.cpp:275
+    ([0x647d538b, 0x647d538b, 0x7f7fffff, 1], 0x7f800000, 2139095040),
+    // Division.cpp:212
+    ([0x7f7fffff, 0x7f7fffff, 0x9e5afe34, 1], 0x7f800000, 2139095040),
+    // Division.cpp:90
+    ([0x7f236db9, 0x7f236db9, 0x80000000, 1], 0x7f800000, 2139095040),
+];
+
+const DIV_FIXUP_ROWS: &[([u32; 4], u32, u32)] = &[
+    // Division.cpp:56
+    ([0x7f800000, 0x7f800000, 0x8087bc0a, 1], 0x80000000, 2147483648),
+    // Division.cpp:67
+    ([0x80000000, 0x80000000, 0x7f236db9, 1], 0xff800000, 4286578688),
+    // Division.cpp:83
+    ([0x808beb57, 0xff800000, 0x808beb57, 0], 0x00000000, 0),
+    // Division.cpp:90
+    ([0x7f236db9, 0x7f236db9, 0x80000000, 1], 0x80000000, 2147483648),
+    // Division.cpp:128
+    ([0x3fbfb16f, 0x7f800000, 0x3fbfb16f, 0], 0x00000000, 0),
+    // Division.cpp:136
+    ([0x00eee942, 0x00eee942, 0x80000000, 1], 0x80000000, 2147483648),
+    // Division.cpp:149
+    ([0x7f800000, 0x8087bc0a, 0x7f800000, 0], 0xff800000, 4286578688),
+    // Division.cpp:153
+    ([0x0082f0ee, 0x00000000, 0x0082f0ee, 0], 0x7f800000, 2139095040),
+    // Division.cpp:155
+    ([0x80000000, 0x80000000, 0x00eee942, 1], 0xff800000, 4286578688),
+    // Division.cpp:159
+    ([0xff800000, 0xff800000, 0x7f480adb, 1], 0x80000000, 2147483648),
+    // Division.cpp:179
+    ([0x7f045f1d, 0x80000000, 0x7f045f1d, 0], 0xff800000, 4286578688),
+    // Division.cpp:192
+    ([0x80000000, 0xff432955, 0x80000000, 0], 0x00000000, 0),
+    // Division.cpp:197
+    ([0xff800000, 0xff800000, 0x808beb57, 1], 0x00000000, 0),
+    // Division.cpp:208
+    ([0x1e52f93a, 0xff800000, 0x1e52f93a, 0], 0x80000000, 2147483648),
+    // Division.cpp:227
+    ([0xff800000, 0xff800000, 0x1e52f93a, 1], 0x80000000, 2147483648),
+    // Division.cpp:251
+    ([0x00000000, 0x00000000, 0x0082f0ee, 1], 0x7f800000, 2139095040),
+    // Division.cpp:277
+    ([0x7f045f1d, 0x7f045f1d, 0x80000000, 1], 0x80000000, 2147483648),
+    // Division.cpp:283
+    ([0x00000000, 0x0082f0ee, 0x00000000, 0], 0x00000000, 0),
+    // Division.cpp:303
+    ([0x00f745cf, 0x7f7fffff, 0x00f745cf, 0], 0x00000000, 0),
+    // Division.cpp:184
+    ([0xb26ef1d1, 0xfee6b9ef, 0xb26ef1d1, 1], 0x00000000, 0),
+];
+
+fn div_inputs(rows: &[([u32; 4], u32, u32)]) -> Vec<[u32; 4]> {
+    rows.iter().map(|r| r.0).collect()
+}
+
+/// `v_div_scale_f32 v5, v1, v2, v3` (the input to scale, the denominator,
+/// the numerator) and the VCC bit it writes, read back through
+/// `v_cndmask_b32`; rows of the `HelperVectors` table measured on the
+/// console's gfx1035 (boykopovar/AnyPS5, `Division.cpp`, FLOAT_MODE 0xc0 —
+/// IEEE off, DX10_CLAMP on) in which the scaled input is one of the two
+/// division operands: zeros and infinities in the numerator and the
+/// denominator, boundary normals, both signs.
+fn div_scale_oracle() -> Probe {
+    let mut body = vop3b(0x16d, 5, VCC as u8, [v(1), v(2), v(3)], false).to_vec();
+    body.extend(vop3(0x101, 6, [int(0), int(1), VCC], NONE));
+    probe(body, div_inputs(DIV_SCALE_ROWS), INT, |i| {
+        let r = DIV_SCALE_ROWS.iter().find(|r| r.0 == i).expect("a table row");
+        vec![r.1, r.2]
+    })
+}
+
+#[test]
+fn div_scale_matches_the_console_oracle() {
+    assert_clean(check(&[div_scale_oracle()]));
+}
+
+/// `v_div_fmas_f32 v5, v1, v2, v3` with VCC preset lane-wise from the row's
+/// fourth input: on the console the post-fma scaling depends on VCC and on
+/// the biased exponent of s2 (`Division.cpp`, same table).
+fn div_fmas_oracle() -> Probe {
+    let mut body = vec![
+        vop1(0x01, 9, int(0)),  // v_mov_b32 v9, 0
+        vopc(0xC5, v(4), 9),    // v_cmp_ne_u32 vcc, v4, v9 — the row's VCC bit
+    ];
+    body.extend(vop3(0x16f, 5, [v(1), v(2), v(3)], NONE));
+    probe(body, div_inputs(DIV_FMAS_ROWS), INT, |i| {
+        vec![DIV_FMAS_ROWS.iter().find(|r| r.0 == i).expect("a table row").1]
+    })
+}
+
+#[test]
+fn div_fmas_matches_the_console_oracle() {
+    assert_clean(check(&[div_fmas_oracle()]));
+}
+
+/// `v_div_fixup_f32 v5, v1, v2, v3` (the quotient, the denominator, the
+/// numerator) for the table's rows with zeros and infinities among the
+/// operands (`Division.cpp`, same table).
+fn div_fixup_oracle() -> Probe {
+    probe(vop3(0x15f, 5, [v(1), v(2), v(3)], NONE), div_inputs(DIV_FIXUP_ROWS), INT, |i| {
+        vec![DIV_FIXUP_ROWS.iter().find(|r| r.0 == i).expect("a table row").1]
+    })
+}
+
+#[test]
+fn div_fixup_matches_the_console_oracle() {
+    assert_clean(check(&[div_fixup_oracle()]));
+}
+
 /// The 16 float predicates of `v_cmp_*_f32` (RDNA2 ISA: `o` ordered, `u`
 /// unordered, `n*` true when unordered).
 fn compare(op: u16, a: u32, b: u32) -> bool {
