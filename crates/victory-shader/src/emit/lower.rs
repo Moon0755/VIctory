@@ -10968,7 +10968,7 @@ mod tests {
             }),
             code,
         };
-        let p = ir::build(&native.code, false, 256).unwrap();
+        let p = ir::build(&native.code, false, 256)?;
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
@@ -11019,7 +11019,7 @@ mod tests {
             }),
             code,
         };
-        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let p = ir::build(&native.code, wave64, 256)?;
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
@@ -11144,6 +11144,48 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    /// The RDNA2-only forms added to the decoder stay rejected: on main as
+    /// unknown opcodes, after the decoder change by the translator. The two
+    /// accepted messages prove the before/after forms of the same refusal.
+    #[test]
+    fn new_rdna2_opcodes_stay_rejected() {
+        let rejected = |result: Result<(), crate::ShaderError>, whats: &[&'static str]| {
+            let err = result.expect_err("the opcode translated");
+            match err {
+                crate::ShaderError::Unsupported { what, .. } if whats.contains(&what) => {}
+                err => panic!("unexpected error: {err}"),
+            }
+        };
+
+        // VOP3 `v_interp_p1_f32 v5, v2, attr0.x` (LLVM's bytes).
+        rejected(
+            lowers(&[0xD600_0005, 0x0202_0400, S_ENDPGM], 0),
+            &["unknown opcode", "an interpolation form"],
+        );
+
+        // A contiguous form of `image_gather4h` with a tracked texture and
+        // sampler: v[0:3], v[2:4], s[12:19], s[8:11], dmask 2, cube.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0
+            0xF40C_0302,
+            0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF184_0218,
+            0x0043_0002, // image_gather4h v[0:3], v[2:4], s[12:19], s[8:11]
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        rejected(
+            lower_with(&words, layout, used).map(|_| ()),
+            &["unknown opcode", "image_gather4h"],
+        );
     }
 
     #[test]
