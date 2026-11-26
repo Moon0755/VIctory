@@ -10987,7 +10987,7 @@ mod tests {
         let p = ir::build(&native.code, false, 256)?;
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
+        let io = io::raise(&p, &native)?;
         lower(&Parts {
             native: &native,
             p: &p,
@@ -11038,7 +11038,7 @@ mod tests {
         let p = ir::build(&native.code, wave64, 256)?;
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        let io = io::raise(&p, &native).unwrap();
+        let io = io::raise(&p, &native)?;
         lower(&Parts {
             native: &native,
             p: &p,
