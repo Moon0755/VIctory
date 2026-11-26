@@ -3181,3 +3181,40 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
     ]));
 }
+
+/// RDNA2 `v_mac_f32` and `v_mac_legacy_f32` in VOP3 encoding honor `neg[2]`
+/// (`-acc`) and `abs[2]` (`|acc|`) on the accumulator VGPR, as `v_fmac_f32`
+/// does: bit 2 modifies the accumulator, not a src2 operand (measured for
+/// `v_fmac_f32` on gfx1031 in `boykopovar/AnyPS5`
+/// `core/libs/prx/libSceAgcDriver/tests/execution/VFmacF32AccumulatorModifiers.cpp`,
+/// `85129d854d`; for encoding `0x106` on gfx1036, documented in AnyPS5
+/// `docs/dev/debt/changes/docs-vop3-mac-accumulator-modifiers.md`, `e6ac22e`).
+/// Every product and sum below is exact, so fused and unfused accumulation
+/// and the legacy zero rule all agree.
+#[test]
+fn v_mac_accumulator_modifiers_match_rdna2_oracle() {
+    const ROWS: [([u32; 4], u32, u32); 8] = [
+        ([0x3F80_0000, 0x4000_0000, 0x3F80_0000, OLD], 0x3F80_0000, 0x4040_0000),
+        ([0x4000_0000, 0x4040_0000, 0xC0C0_0000, OLD], 0x4140_0000, 0x4140_0000),
+        ([0xBF80_0000, 0x4080_0000, 0x4000_0000, OLD], 0xC0C0_0000, 0xC000_0000),
+        ([0x3F00_0000, 0x3F00_0000, 0xBE80_0000, OLD], 0x3F00_0000, 0x3F00_0000),
+        ([0x3FC0_0000, 0x3FA0_0000, 0xBEC0_0000, OLD], 0x4010_0000, 0x4010_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7F80_0000, OLD], 0xFF80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0xFF80_0000, OLD], 0x7F80_0000, 0x7F80_0000),
+        ([0x4080_0000, 0x3F00_0000, 0x3E80_0000, OLD], 0x3FE0_0000, 0x4010_0000),
+    ];
+    let inputs: Vec<[u32; 4]> = ROWS.iter().map(|&(i, _, _)| i).collect();
+    let mac_probe = |op: u32, m: M, pick: fn(&([u32; 4], u32, u32)) -> u32| {
+        let mut body = vec![vop1(0x01, 5, v(3))];
+        body.extend(vop3(op, 5, [v(1), v(2), 0], m));
+        probe(body, inputs.clone(), F32, move |i| {
+            vec![pick(ROWS.iter().find(|&&(r, _, _)| r == i).expect("known input"))]
+        })
+    };
+    assert_clean(check(&[
+        mac_probe(0x106, M { neg: 4, ..NONE }, |r| r.1),
+        mac_probe(0x106, M { abs: 4, ..NONE }, |r| r.2),
+        mac_probe(0x11F, M { neg: 4, ..NONE }, |r| r.1),
+        mac_probe(0x11F, M { abs: 4, ..NONE }, |r| r.2),
+    ]));
+}
