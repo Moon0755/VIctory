@@ -3204,7 +3204,7 @@ fn v_mac_accumulator_modifiers_match_rdna2_oracle() {
         ([0x4080_0000, 0x3F00_0000, 0x3E80_0000, OLD], 0x3FE0_0000, 0x4010_0000),
     ];
     let inputs: Vec<[u32; 4]> = ROWS.iter().map(|&(i, _, _)| i).collect();
-    let mac_probe = |op: u32, m: M, pick: fn(&([u32; 4], u32, u32)) -> u32| {
+    let mac_probe = |op: u16, m: M, pick: fn(&([u32; 4], u32, u32)) -> u32| {
         let mut body = vec![vop1(0x01, 5, v(3))];
         body.extend(vop3(op, 5, [v(1), v(2), 0], m));
         probe(body, inputs.clone(), F32, move |i| {
