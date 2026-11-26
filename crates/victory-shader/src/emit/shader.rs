@@ -580,6 +580,8 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (flags::ATOMIC64_TYPED, uses.atomic64_typed),
+            (flags::ATOMIC64_HEAP, uses.atomic64_heap),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
@@ -1086,6 +1088,118 @@ mod tests {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
+        }
+    }
+
+    /// Live raw and typed heap atomics require different features, and
+    /// both still write the full 64-bit value when run on the host.
+    #[test]
+    fn heap_atomics_declare_their_resource_kind_and_keep_both_words() {
+        use super::super::HostShader;
+        use super::super::host::{Dispatch, Host, View};
+        use super::super::validator::Validator;
+        use crate::dxbc::{Container, FourCC};
+
+        let mut validator = Validator::load(Validator::default_path().as_deref()).ok();
+        let host = Host::new(true);
+        for (typed, view) in [(false, View::RawUav(2)), (true, View::Uint2TextureUav(1, 1))] {
+            let mut s = Shader::new(false);
+            s.threads = Some([1, 1, 1]);
+            s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
+            let entry = s.entry;
+            let zero = s.m.i32(0);
+            let undef = s.m.undef(s.t.i32);
+            let (kind, props, y) = if typed { (2, 0x105, zero) } else { (11, 0, undef) };
+            let handle = s.heap_handle(entry, zero, false, false, (kind | 0x1000, props));
+            let i64t = s.m.int(64);
+            let value = s.m.int_const(i64t, 0x0000_0001_2345_6789);
+            s.op(
+                entry, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78,
+                &[handle, zero, zero, y, undef, value],
+            );
+            s.m.terminate(entry, Term::Ret);
+            let dxil = s.finish();
+
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil.clone())
+                    .unwrap_or_else(|e| panic!("typed={typed}: {e}"));
+            }
+            let container = Container::parse(&dxil).unwrap();
+            let features = u64::from_le_bytes(container.part(FourCC::SFI0).unwrap().data.try_into().unwrap());
+            const TYPED: u64 = 0x40_0000;
+            const HEAP: u64 = 0x1000_0000;
+            const INT64: u64 = 0x8000;
+            assert_eq!(
+                features & (TYPED | HEAP | INT64),
+                HEAP | INT64 | if typed { TYPED } else { 0 },
+                "typed={typed}",
+            );
+
+            if let Ok(host) = &host {
+                let shader = HostShader {
+                    stage: crate::HwStage::Cs,
+                    dxil,
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: true,
+                    heap_writes: false,
+                    view_marks: false,
+                };
+                let (root, pso) = host.compute_pipeline(&shader)
+                    .unwrap_or_else(|e| panic!("typed={typed}: {e}"));
+                let out = host.dispatch(&root, &pso, &Dispatch {
+                    roots: Vec::new(),
+                    views: &[view],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                }).unwrap_or_else(|e| panic!("typed={typed}: {e}"));
+                assert_eq!(out[0], [0x2345_6789, 1], "typed={typed}");
+            }
+        }
+        if validator.is_none() {
+            eprintln!("no DXIL validator; validation skipped");
+        }
+        if let Err(e) = host {
+            eprintln!("no WARP device ({e}); execution skipped");
+        }
+    }
+
+    /// The 64-bit atomic features follow the written atomics: lowering sets
+    /// them where it makes one, and one on a path no lane takes is not
+    /// written, so the container declares none of them (and the validator,
+    /// where there is one, accepts it).
+    #[test]
+    fn a_64_bit_atomic_on_an_untaken_path_declares_no_atomic64_features() {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let (entry, live, dead) = (s.entry, s.m.new_block(), s.m.new_block());
+        let yes = s.m.bool(true);
+        s.m.terminate(entry, Term::CondBr(yes, live, dead));
+        s.m.terminate(live, Term::Ret);
+        s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
+        let index = s.m.i32(0);
+        let h = s.heap_handle(dead, index, false, false, (2 | 0x1000, 0x105));
+        let i64t = s.m.int(64);
+        let (or, undef, value) = (s.m.i32(2), s.m.undef(s.t.i32), s.m.int_const(i64t, 1));
+        s.op(dead, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &[h, or, undef, undef, undef, value]);
+        s.m.terminate(dead, Term::Ret);
+        let mut dxil = s.finish();
+        // The SFI0 part: its name, its size, then the feature bits.
+        let at = dxil.windows(4).position(|w| w == b"SFI0").expect("an SFI0 part");
+        let features = u64::from_le_bytes(dxil[at + 8..at + 16].try_into().unwrap());
+        let (atomic64_typed, atomic64_heap, int64) = (0x40_0000, 0x1000_0000, 0x8000);
+        assert_eq!(features & (atomic64_typed | atomic64_heap | int64), 0, "{features:#x}");
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap_or_else(|e| panic!("{e}"));
         }
     }
 }
