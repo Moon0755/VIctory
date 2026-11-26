@@ -77,10 +77,10 @@ fn boxes(w: &[u32], box16: bool, ray: &Ray) -> [u32; 4] {
             let pos = ray.inv[a] >= 0.0;
             let (mut n, mut x) = if pos { (tlo, thi) } else { (thi, tlo) };
             let (dn, dx) = if pos { (dlo, dhi) } else { (dhi, dlo) };
-            if dn == 0.0 && n.is_nan() {
+            if dn == 0.0 && n.is_nan() && ray.inv[a].is_infinite() {
                 n = f32::NEG_INFINITY;
             }
-            if dx == 0.0 && x.is_nan() {
+            if dx == 0.0 && x.is_nan() && ray.inv[a].is_infinite() {
                 x = f32::INFINITY;
             }
             nan |= n.is_nan() || x.is_nan();
@@ -232,6 +232,30 @@ fn nan_bounds_miss() {
     let mut ray = along_x();
     ray.origin[1] = f32::NAN;
     assert_eq!(boxes(&w, false, &ray), [INVALID; 4]);
+}
+
+/// A ray whose inverse direction is NaN on the axis of a degenerate slab
+/// (both planes through the origin): the plane rule is for `0 * +-inf` —
+/// a NaN inverse is not an infinite one and the box misses. GPURT's
+/// `fast_intersect_bbox` (IntersectCommon.hlsl) rejects a NaN interval the
+/// same way.
+fn nan_inverse_degenerate_case() -> (Vec<u32>, u32, Ray) {
+    let deg = [0.0, -1.0, -1.0, 0.0, 1.0, 1.0];
+    let w = box32([deg, EMPTY, EMPTY, EMPTY]);
+    let mut ray = along_x();
+    ray.inv[0] = f32::NAN;
+    (w, 5, ray)
+}
+
+#[test]
+fn a_nan_inverse_in_a_degenerate_slab_misses() {
+    let (w, ty, ray) = nan_inverse_degenerate_case();
+    assert_eq!(intersect(&w, ty, &ray), [INVALID; 4]);
+    // The same slab with the genuine infinite inverse still hits.
+    let mut ray = along_x();
+    ray.dir[0] = 0.0;
+    ray.inv[0] = f32::INFINITY;
+    assert_eq!(intersect(&w, ty, &ray), [1, INVALID, INVALID, INVALID]);
 }
 
 #[test]
@@ -717,9 +741,12 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
     // memory too.
     assert!(shader.memory);
     let mut rng = Rng(if wide { 77 } else { 7 });
-    let batches: Vec<Vec<(Vec<u32>, u32, Ray)>> = (0..batches)
+    let mut batches: Vec<Vec<(Vec<u32>, u32, Ray)>> = (0..batches)
         .map(|_| (0..LANES).map(|_| case(&mut rng)).collect())
         .collect();
+    for batch in batches.iter_mut() {
+        batch[0] = nan_inverse_degenerate_case();
+    }
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
