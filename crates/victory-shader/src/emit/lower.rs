@@ -9539,7 +9539,7 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords, byte) = match index {
+            let (h, coords, byte, atomic_byte) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
@@ -9549,22 +9549,30 @@ impl<'a> Lower<'a> {
                     let s = self.s.m.i32(stride);
                     let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
                     let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
+                    (h, [index, off, iu], byte, byte)
                 }
                 None => {
+                    let atomic_byte = off;
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
-                    (h, [off, iu, iu], off)
+                    (h, [off, iu, iu], off, atomic_byte)
                 }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
             let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if returns => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
-            };
-            let at = self.begin_guarded(guard);
+            // Atomics require natural alignment: an unaligned access is
+            // dropped and its active GLC lane receives zero.
+            let c = self.cur;
+            let three = self.s.m.i32(3);
+            let zero = self.s.m.i32(0);
+            let low = self.s.m.bin(c, Bin::And, atomic_byte, three);
+            let aligned = self.s.m.cmp(c, pred::EQ, low, zero);
+            let atomic_guard = Some(match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, aligned),
+                None => aligned,
+            });
+            let at = self.begin_guarded(atomic_guard);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -9587,9 +9595,9 @@ impl<'a> Lower<'a> {
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
             self.mark_view_write(h, byte, 4, None);
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let r = self.end_guarded(at, &[(r, zero)])[0];
             if returns {
-                self.write(inst, Reg::V(reg), r, None);
+                self.write(inst, Reg::V(reg), r, guard);
             }
             return Ok(());
         }
