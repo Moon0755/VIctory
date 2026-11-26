@@ -2100,14 +2100,22 @@ impl<'a> Lower<'a> {
                 self.as_float(x)
             }
         };
-        if v.abs >> k & 1 != 0 {
+        f = self.float_mods(v.abs >> k & 1 != 0, v.neg >> k & 1 != 0, f);
+        Ok(f)
+    }
+
+    /// Applies a float source's input modifiers in the hardware's order:
+    /// `abs` first, then `neg` as `-0.0 - x` (a subtraction that keeps a
+    /// NaN's payload instead of reintroducing its sign).
+    fn float_mods(&mut self, abs: bool, neg: bool, mut f: V) -> V {
+        if abs {
             f = self.unary(6, f);
         }
-        if v.neg >> k & 1 != 0 {
+        if neg {
             let z = self.s.m.f32(0x8000_0000);
             f = self.s.m.bin(self.cur, Bin::Sub, z, f);
         }
-        Ok(f)
+        f
     }
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
@@ -6326,13 +6334,7 @@ impl<'a> Lower<'a> {
                         self.as_float(x)
                     }
                 };
-                if v.abs >> 2 & 1 != 0 {
-                    acc = self.unary(6, acc);
-                }
-                if v.neg >> 2 & 1 != 0 {
-                    let z = self.s.m.f32(0x8000_0000);
-                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
-                }
+                acc = self.float_mods(v.abs >> 2 & 1 != 0, v.neg >> 2 & 1 != 0, acc);
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -6507,13 +6509,7 @@ impl<'a> Lower<'a> {
                     } else {
                         self.as_float(x)
                     };
-                    if v.neg_hi >> i & 1 != 0 {
-                        x = self.unary(6, x);
-                    }
-                    if v.neg >> i & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        x = self.s.m.bin(c, Bin::Sub, z, x);
-                    }
+                    x = self.float_mods(v.neg_hi >> i & 1 != 0, v.neg >> i & 1 != 0, x);
                     xs.push(x);
                 }
                 let mut r = self.fmad(xs[0], xs[1], xs[2]);
@@ -6909,13 +6905,7 @@ impl<'a> Lower<'a> {
         let mut f = self
             .s
             .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        if v.abs >> k & 1 != 0 {
-            f = self.unary(6, f);
-        }
-        if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
-        }
+        f = self.float_mods(v.abs >> k & 1 != 0, v.neg >> k & 1 != 0, f);
         Ok(f)
     }
 
@@ -7090,13 +7080,7 @@ impl<'a> Lower<'a> {
                 let mut acc = self
                     .s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                if v.abs >> 2 & 1 != 0 {
-                    acc = self.unary(6, acc);
-                }
-                if v.neg >> 2 & 1 != 0 {
-                    let z = self.s.m.f32(0x8000_0000);
-                    acc = self.s.m.bin(c, Bin::Sub, z, acc);
-                }
+                acc = self.float_mods(v.abs >> 2 & 1 != 0, v.neg >> 2 & 1 != 0, acc);
                 acc
             } else {
                 self.half_fsrc(inst, 2)?
@@ -7401,10 +7385,7 @@ impl<'a> Lower<'a> {
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
                     let neg = if high { v.neg_hi } else { v.neg };
-                    if neg >> k & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        f = self.s.m.bin(c, Bin::Sub, z, f);
-                    }
+                    f = self.float_mods(false, neg >> k & 1 != 0, f);
                     xs.push(f);
                 } else {
                     xs.push(h);
