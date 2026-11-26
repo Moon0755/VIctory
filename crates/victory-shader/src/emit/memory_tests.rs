@@ -924,3 +924,174 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A 16-bit buffer load at a byte offset of 3 mod 4 joins its bytes across
+/// the dword boundary, as the hardware does (the AnyPS5 BufferHalfStraddle
+/// measurement): lanes read `buffer_load_ushort` at byte `lane * 4 + 3` of a
+/// raw view whose byte `i` holds `i`, through a root SRV. The high byte is
+/// byte 0 of the next dword.
+#[test]
+fn buffer_load_ushort_joins_bytes_across_dwords() {
+    /// MUBUF `op` (offen) of `vdata` at `vaddr` plus `byte_off` through
+    /// `s[srsrc:srsrc+3]`.
+    const fn mubuf_off(op: u32, vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 12 | (byte_off as u32 & 0xFFF),
+            0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
+    }
+    const V_LSHLREV_B32: u32 = 0x1A;
+    const BUFFER_LOAD_USHORT: u32 = 10;
+    let mut w = vec![
+        s_mov_b32(5, ZERO as u8), // s[4:5]: the table at s4
+        s_mov_b32(0, 6),          // s[0:3]: the root SRV's buffer descriptor
+        0x8801_FF07,
+        0x0001_0000, // s_or_b32 s1, s7, stride 1
+        0xBE82_03C1, // s_mov_b32 s2, -1
+        0xBE83_03FF,
+        0x1101_4FAC, // s_mov_b32 s3, (the console's buffer word 3)
+    ];
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    w.push(vop2(V_LSHLREV_B32, 1, 128 + 2, 0)); // v1 = lane << 2
+    // buffer_load_ushort v2, v1, s[0:3] offen offset:3 — byte lane*4 + 3.
+    w.extend(mubuf_off(BUFFER_LOAD_USHORT, 2, 1, 0, 3));
+    w.push(vop2(V_LSHLREV_B32, 3, 128 + 2, 0)); // v3 = lane << 2
+    w.push(S_WAITCNT_ALL);
+    w.extend(mubuf_off(0x1C, 2, 3, 8, 0)); // buffer_store_dword v2, v3, s[8:11] offen
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 4,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Byte `i` of the copy is `i` (for `i < 256`).
+    let copy: Vec<u32> = (0..64u32)
+        .map(|k| 4 * k | (4 * k + 1) << 8 | (4 * k + 2) << 16 | (4 * k + 3) << 24)
+        .collect();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        // The table at heap index 0, the copy's view at 1, the root address
+        // at the copy's start.
+        (ud[4], ud[6], ud[7]) = (0, 1, 0);
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::RawUav(32),
+                        View::Buffer {
+                            data: &copy,
+                            stride: super::host::Stride::Raw,
+                        },
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        // Lane `l` reads at byte `4*l + 3`: the halfword is byte `4*l+3`
+        // in its low byte and byte `4*l+4` — byte 0 of the next dword — in
+        // its high byte.
+        let want: Vec<u32> = (0..32)
+            .map(|lane| 4 * lane + 3 | (4 * lane + 4) << 8)
+            .collect();
+        assert_eq!(out[0], want.as_slice(), "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
