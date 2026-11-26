@@ -6059,6 +6059,39 @@ impl<'a> Lower<'a> {
                 // and bit-negate the raw operand bits, while `v_cubema`
                 // flushes a zero or denormal result to +0.
                 let (rx, ry, rz) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                // The coordinate bits `v_cubesc`/`v_cubetc` select: the input
+                // modifiers on bits (abs clears the sign, neg flips it), so a
+                // denormal survives however the host's float abs/neg treats it.
+                let bits = |l: &mut Self, k: usize| -> Result<V, Why> {
+                    let op = *v.src.get(k).ok_or("a missing operand")?;
+                    let mut b = match op {
+                        _ if k == 0 && l.src0.is_some() => l.src0.expect("checked"),
+                        Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
+                            if !matches!(op, Operand::Scalar { code: NULL, .. }) =>
+                        {
+                            let r = if matches!(op, Operand::Vector { .. }) {
+                                Reg::V(reg)
+                            } else {
+                                Reg::S(reg)
+                            };
+                            let val = inst.read(r).ok_or("an unread operand")?;
+                            match l.floats.get(&val) {
+                                Some(&f) => l.as_int(f),
+                                None => l.i32_of(val)?,
+                            }
+                        }
+                        _ => l.operand(inst, &op)?,
+                    };
+                    if v.abs >> k & 1 != 0 {
+                        let m = l.s.m.i32(0x7FFF_FFFF);
+                        b = l.s.m.bin(c, Bin::And, b, m);
+                    }
+                    if v.neg >> k & 1 != 0 {
+                        let m = l.s.m.i32(0x8000_0000);
+                        b = l.s.m.bin(c, Bin::Xor, b, m);
+                    }
+                    Ok(b)
+                };
                 let (x, y, z) = (self.ftz(rx), self.ftz(ry), self.ftz(rz));
                 let (ax, ay, az) = (self.unary(6, x), self.unary(6, y), self.unary(6, z));
                 let zx = self.s.m.cmp(c, pred::OGE, az, ax);
@@ -6093,7 +6126,7 @@ impl<'a> Lower<'a> {
                         pick(self, zf, yf, xf)
                     }
                     "v_cubesc_f32" => {
-                        let (ix, iz) = (self.as_int(rx), self.as_int(rz));
+                        let (ix, iz) = (bits(self, 0)?, bits(self, 2)?);
                         let (nz, nx) = (neg(self, z), neg(self, x));
                         // Select the coordinate and its sign adjustment separately, so
                         // the selected result stays integer data even when subnormal.
@@ -6106,7 +6139,7 @@ impl<'a> Lower<'a> {
                         self.as_float(bits)
                     }
                     "v_cubetc_f32" => {
-                        let (iy, iz) = (self.as_int(ry), self.as_int(rz));
+                        let (iy, iz) = (bits(self, 1)?, bits(self, 2)?);
                         let ny = neg(self, y);
                         let (my, mz) = (neg_bits(self, iy), neg_bits(self, iz));
                         let yf = self.s.m.select(c, ny, mz, iz);
