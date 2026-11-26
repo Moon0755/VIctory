@@ -141,6 +141,31 @@ const HALF_STORE_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s2 a table with a raw UAV. Each lane first adds 7 to the
+/// aligned dword at byte `8 × lane + 4`, then tries the same add at the
+/// unaligned byte `8 × lane + 5` and stores the second atomic's returned
+/// value at byte `0x100 + 4 × lane`.
+const UNALIGNED_ATOMIC_WAVE32: &[u32] = &[
+    0xBE84_0302, // s_mov_b32 s4, s2
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0x3402_0083, // v_lshlrev_b32 v1, 3, v0
+    0x7E04_0287, // v_mov_b32 v2, 7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE0C8_5004,
+    0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen glc offset:4
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E04_0287, // v_mov_b32 v2, 7
+    0xE0C8_5005,
+    0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen glc offset:5
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+    0xE070_1100,
+    0x8002_0203, // buffer_store_dword v2, v3, s[8:11], 0 offen offset:0x100
+    0xBF81_0000, // s_endpgm
+];
+
 fn param(root: RootType, user_data: u8) -> RootParam {
     RootParam {
         root,
@@ -469,6 +494,53 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(half).collect();
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A buffer atomic at a byte address that is not dword-aligned is dropped:
+/// RDNA2 leaves memory untouched and an active GLC lane receives zero. The
+/// aligned control at the same dword proves that the atomic itself executes.
+#[test]
+fn unaligned_buffer_atomics_are_dropped_and_return_zero() {
+    let shader = build(
+        UNALIGNED_ATOMIC_WAVE32,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let views = [View::RawUav(128)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let mut want = vec![0; 128];
+        for lane in 0..32usize {
+            want[2 * lane + 1] = 7;
+        }
         assert_eq!(words[0], want, "{label}");
         ran += 1;
     }
