@@ -4145,22 +4145,46 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked descriptor")?;
         let kind = self.used_kind(src);
         let c = self.cur;
+        let imm = *offset as u32;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
+        let offset = &(imm.wrapping_add(base) as i32);
+        let mut start = self.s.m.i32(imm);
         let mut addr = self.s.m.i32(*offset as u32);
+        let mut over = None;
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            let so = self.operand(inst, soffset)?;
+            let sum = self.s.m.bin(c, Bin::Add, start, so);
+            over = Some(self.s.m.cmp(c, pred::IULT, sum, start));
+            start = sum;
+            addr = sum;
+            if base != 0 {
+                let b = self.s.m.i32(base);
+                addr = self.s.m.bin(c, Bin::Add, addr, b);
+            }
+        }
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            let so = self.operand(inst, soffset)?;
-            addr = self.s.m.bin(c, Bin::Add, addr, so);
-        }
+        let zero = self.s.m.i32(0);
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let mut o = over;
+                if k != 0 && over.is_some() {
+                    let wide = self.s.m.bin(c, Bin::Add, start, off);
+                    let wrapped = self.s.m.cmp(c, pred::IULT, wide, start);
+                    o = Some(match o {
+                        Some(x) => self.s.m.bin(c, Bin::Or, x, wrapped),
+                        None => wrapped,
+                    });
+                }
                 let x = self.code_dword(a)?;
+                let x = match o {
+                    Some(o) => self.s.m.select(c, o, zero, x),
+                    None => x,
+                };
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -4187,6 +4211,15 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let mut o = over;
+                if k != 0 && over.is_some() {
+                    let wide = self.s.m.bin(c, Bin::Add, start, off);
+                    let wrapped = self.s.m.cmp(c, pred::IULT, wide, start);
+                    o = Some(match o {
+                        Some(x) => self.s.m.bin(c, Bin::Or, x, wrapped),
+                        None => wrapped,
+                    });
+                }
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.s.op(
@@ -4199,6 +4232,10 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = match o {
+                    Some(o) => self.s.m.select(c, o, zero, x),
+                    None => x,
+                };
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -4214,6 +4251,16 @@ impl<'a> Lower<'a> {
         };
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let mut o = over;
+            if k != 0 && over.is_some() {
+                let wide = self.s.m.bin(c, Bin::Add, start, off);
+                let wrapped = self.s.m.cmp(c, pred::IULT, wide, start);
+                o = Some(match o {
+                    Some(x) => self.s.m.bin(c, Bin::Or, x, wrapped),
+                    None => wrapped,
+                });
+            }
             let x = match constant {
                 Some(base) => {
                     let byte = base + 4 * k;
@@ -4236,10 +4283,13 @@ impl<'a> Lower<'a> {
                     self.s.m.extract(c, row, (byte >> 2) & 3)
                 }
                 None => {
-                    let off = self.s.m.i32(4 * k);
                     let a = self.s.m.bin(c, Bin::Add, addr, off);
                     self.cbuffer_dword(h, a)
                 }
+            };
+            let x = match o {
+                Some(o) => self.s.m.select(c, o, zero, x),
+                None => x,
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
