@@ -2811,18 +2811,29 @@ impl<'a> Lower<'a> {
         match v.omod {
             0 => {}
             k => {
-                // On the flushed result; a zero or denormal product comes out
-                // +0 (measured on RDNA2 with IEEE mode off).
+                // On the flushed result (measured on RDNA2 with IEEE mode off):
+                // a zero (or flushed denormal) comes out +0; div:2 on the
+                // smallest normal exponent (exp == 1, including 0x00ff_ffff
+                // before rounding) underflows to a zero of its sign.
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
                 let c = self.cur;
-                let k = self.s.m.f32(factor.to_bits());
+                let fk = self.s.m.f32(factor.to_bits());
                 let r = self.ftz(f);
-                let r = self.s.m.bin(c, Bin::Mul, r, k);
-                let x = self.as_int(r);
+                let ix = self.as_int(r);
                 let (exp, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
-                let e = self.s.m.bin(c, Bin::And, x, exp);
-                let tiny = self.s.m.cmp(c, pred::EQ, e, zero);
-                let x = self.s.m.select(c, tiny, zero, x);
+                let e = self.s.m.bin(c, Bin::And, ix, exp);
+                let was_zero = self.s.m.cmp(c, pred::EQ, e, zero);
+                let scaled = self.as_int(self.s.m.bin(c, Bin::Mul, r, fk));
+                let x = if k == 3 {
+                    let min_exp = self.s.m.i32(0x0080_0000);
+                    let sign_mask = self.s.m.i32(0x8000_0000);
+                    let underflow = self.s.m.cmp(c, pred::EQ, e, min_exp);
+                    let sign = self.s.m.bin(c, Bin::And, ix, sign_mask);
+                    let x = self.s.m.select(c, underflow, sign, scaled);
+                    self.s.m.select(c, was_zero, zero, x)
+                } else {
+                    self.s.m.select(c, was_zero, zero, scaled)
+                };
                 f = self.as_float(x);
             }
         }

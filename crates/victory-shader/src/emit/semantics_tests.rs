@@ -812,17 +812,23 @@ fn mods_in(x: u32, k: usize, m: M) -> u32 {
     x
 }
 
-/// Output modifiers of a float result: the multiplier, which turns -0
-/// into +0, then the clamp to [0, 1], which gives +0 for NaN (DX10 clamp)
-/// and for -0. Measured on RDNA2 by the Leonida project (gfx1031 and
-/// gfx1036 for the multiplier with IEEE off and denormals flushed; the
-/// clamp's -0 and NaN on gfx1036 for f16).
+/// Output modifiers of a float result: the multiplier, which turns a zero
+/// (or flushed denormal) input into `+0`, while `div:2` underflowing from the
+/// smallest normal exponent (`exp == 1`) preserves sign before rounding; then
+/// the clamp to `[0, 1]`, which gives `+0` for NaN (DX10 clamp) and for `-0`.
+/// Measured on RDNA2 by the Leonida project (`F32OutputModifier.cpp`, commit
+/// `d3f2611384`, IEEE off and f32 denormals flushed; the clamp's `-0` and
+/// NaN on gfx1036 for f16).
 fn mods_out(r: u32, m: M) -> u32 {
     let mut r = r;
     if m.omod != 0 && !nan(r) {
-        r = out(fl(r) * [1.0, 2.0, 4.0, 0.5][usize::from(m.omod)]);
-        if r == 0x8000_0000 {
+        let f = ftz(r);
+        if f & 0x7FFF_FFFF == 0 {
             r = 0;
+        } else if m.omod == 3 && f & 0x7F80_0000 == 0x0080_0000 {
+            r = f & 0x8000_0000;
+        } else {
+            r = out(fl(f) * [1.0, 2.0, 4.0, 0.5][usize::from(m.omod)]);
         }
     }
     if m.clamp {
@@ -3179,5 +3185,86 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         probe(plain, inputs.clone(), INT, |i| vec![i[0], 0, 0, 0]),
         probe(more, inputs.clone(), INT, |i| vec![i[0], 0, 0, i[0]]),
         probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
+    ]));
+}
+
+/// RDNA2 f32 `div:2` output modifier in IEEE=0, f32 denormals flushed (`0xc0`):
+/// zero or flushed-denormal inputs become `+0`, whereas `exp == 1` values
+/// (`0x0080_0000..=0x00ff_ffff`, including negative `-FLT_MIN`) underflow to
+/// a zero preserving sign before rounding.
+/// Measured hardware rows from `boykopovar/AnyPS5`
+/// `core/libs/prx/libSceAgcDriver/tests/execution/F32OutputModifier.cpp` (`d3f2611384`).
+#[test]
+fn f32_omod_div2_underflow_matches_rdna2_oracle() {
+    let div2 = M { omod: 3, ..NONE };
+    let mul2 = M { omod: 1, ..NONE };
+    let clamp_div2 = M {
+        omod: 3,
+        clamp: true,
+        ..NONE
+    };
+    let make2 = |op: u16, m: M, rows: Vec<([u32; 4], u32)>| {
+        let inputs: Vec<[u32; 4]> = rows.iter().map(|&(i, _)| i).collect();
+        probe(vop3(op, 5, [v(1), v(2), 0], m), inputs, INT, move |i| {
+            vec![
+                rows.iter()
+                    .find(|&&(r, _)| r == i)
+                    .expect("known input")
+                    .1,
+            ]
+        })
+    };
+    let mul_div2_rows = vec![
+        ([0x8000_0000, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x8000_0000),
+        ([0x00FF_FFFF, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x3F80_0000, 0x0100_0000, 0, OLD], 0x0080_0000),
+        ([0xBF80_0000, 0x0100_0000, 0, OLD], 0x8080_0000),
+    ];
+    let mul_mul2_rows = vec![
+        ([0x8000_0000, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x8100_0000),
+    ];
+    let add_div2_rows = vec![
+        ([0x0000_0000, 0x8080_0000, 0, OLD], 0x8000_0000),
+        ([0x0000_0000, 0x0080_0000, 0, OLD], 0x0000_0000),
+        ([0x8000_0000, 0x8000_0000, 0, OLD], 0x0000_0000),
+    ];
+    let min_div2_rows = vec![
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x8000_0000),
+        ([0x00FF_FFFF, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x0000_0000, 0x8080_0000, 0, OLD], 0x8000_0000),
+        ([0x8080_0000, 0x8080_0000, 0, OLD], 0x8000_0000),
+    ];
+    let fma_div2_rows = [
+        ([0x0000_0000, 0x8080_0000, 0x8080_0000, OLD], 0x8000_0000),
+        ([0x8000_0000, 0x3F80_0000, 0x8000_0000, OLD], 0x0000_0000),
+    ];
+    let mul_clamp_div2_rows = vec![
+        ([0x00FF_FFFF, 0x3F80_0000, 0, OLD], 0x0000_0000),
+        ([0x3F80_0000, 0x0100_0000, 0, OLD], 0x0080_0000),
+        ([0x8080_0000, 0x3F80_0000, 0, OLD], 0x0000_0000),
+    ];
+    let fma_inputs: Vec<[u32; 4]> = fma_div2_rows.iter().map(|&(i, _)| i).collect();
+    assert_clean(check(&[
+        make2(0x108, div2, mul_div2_rows),
+        make2(0x108, mul2, mul_mul2_rows),
+        make2(0x103, div2, add_div2_rows),
+        make2(0x10F, div2, min_div2_rows),
+        probe(
+            vop3(0x14B, 5, [v(1), v(2), v(3)], div2),
+            fma_inputs,
+            INT,
+            move |i| {
+                vec![
+                    fma_div2_rows
+                        .iter()
+                        .find(|&&(r, _)| r == i)
+                        .expect("known input")
+                        .1,
+                ]
+            },
+        ),
+        make2(0x108, clamp_div2, mul_clamp_div2_rows),
     ]));
 }
