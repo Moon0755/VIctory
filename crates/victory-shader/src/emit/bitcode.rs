@@ -625,9 +625,49 @@ impl Module {
                     u.sampler_heap |= sampler;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
+                if matches!(name, "dx.op.atomicBinOp.i64" | "dx.op.atomicCompareExchange.i64")
+                    && let Some(&handle) = args.get(1)
+                {
+                    let (typed, from_heap) = self.atomic64_handle_kinds(handle);
+                    u.atomic64_typed |= typed;
+                    u.atomic64_heap |= from_heap;
+                }
             }
         }
         u
+    }
+
+    /// What the handle of a 64-bit atomic is: `(typed, from the heap)`, from
+    /// the annotation (kinds 1-10 are typed resources) and the call the
+    /// annotation is of. Handles are not joined: lowering joins the heap
+    /// index and makes the handle after it, and the validator refuses a phi
+    /// or a select of handles, so there is one annotation and one source.
+    fn atomic64_handle_kinds(&self, handle: V) -> (bool, bool) {
+        let name = |v: V| match v {
+            V::Inst(i) => match &self.insts[i as usize].op {
+                Op::Call(f, _) => self.funcs[*f as usize].name.as_str(),
+                _ => "",
+            },
+            _ => "",
+        };
+        let (mut typed, mut source) = (false, handle);
+        if name(handle) == "dx.op.annotateHandle"
+            && let V::Inst(i) = handle
+            && let Op::Call(_, args) = &self.insts[i as usize].op
+        {
+            // Arguments: opcode, handle, properties.
+            if let Some(&V::Const(props)) = args.get(2)
+                && let Const::Aggregate(fields) = &self.consts[props as usize].1
+                && let Some(&first) = fields.first()
+                && let Some(props0) = self.int_value(V::Const(first))
+            {
+                typed = (1..=10).contains(&(props0 & 0xFF));
+            }
+            if let Some(&raw) = args.get(1) {
+                source = raw;
+            }
+        }
+        (typed, name(source).starts_with("dx.op.createHandleFromHeap"))
     }
 
     /// Which instructions are written: those [`Module::rooted`], the
@@ -1153,6 +1193,10 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// 64-bit integer atomics on typed resources.
+    pub atomic64_typed: bool,
+    /// 64-bit integer atomics on resources from the descriptor heap.
+    pub atomic64_heap: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
@@ -1883,6 +1927,53 @@ mod tests {
         let _ = (m.call(live, sink, vec![t]), h);
         let u = m.uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
+    }
+
+    /// 64-bit atomics set the typed and heap features only where a written
+    /// atomic is on a typed resource, or on one from the heap.
+    #[test]
+    fn uses_tracks_atomic64_typed_and_heap_flags() {
+        const HEAP: &str = "dx.op.createHandleFromHeap";
+        const BINDING: &str = "dx.op.createHandleFromBinding";
+        // (kind, the handle's source, atomic, on the taken edge) -> (typed,
+        // heap). The source's signature stands in for both calls: only its
+        // name is read.
+        let build = |kind: u32, source: &str, name: &str, taken: bool| {
+            let (mut m, b, _sink) = module(3);
+            let [entry, live, dead] = b[..] else { unreachable!() };
+            let (i32t, i64t, handle_t) = (m.int(32), m.int(64), m.int(8));
+            let props_ty = m.named_struct("props", vec![i32t, i32t]);
+            let annotate_ty = m.func_ty(handle_t, vec![i32t, handle_t, props_ty]);
+            let annotate = m.function("dx.op.annotateHandle", annotate_ty, Some(Attr::ReadNone), false);
+            let i1t = m.int(1);
+            let make_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+            let make = m.function(source, make_ty, Some(Attr::ReadNone), false);
+            let atomic_ty = m.func_ty(i64t, vec![i32t, handle_t, i32t, i32t, i32t, i32t, i64t]);
+            let atomic = m.function(name, atomic_ty, Some(Attr::NoUnwind), false);
+            let op = m.i32(if source == HEAP { 218 } else { 217 });
+            let (zero, or, no, yes) = (m.i32(0), m.i32(2), m.bool(false), m.bool(true));
+            m.terminate(entry, Term::CondBr(yes, live, dead));
+            m.terminate(live, Term::Ret);
+            m.terminate(dead, Term::Ret);
+            let at = if taken { live } else { dead };
+            let raw = m.call(at, make, vec![op, zero, no, no]);
+            let (annotate_op, p0, p1) = (m.i32(216), m.i32(kind), m.i32(0x105));
+            let props = m.aggregate(props_ty, &[p0, p1]);
+            let h = m.call(at, annotate, vec![annotate_op, raw, props]);
+            let (atomic_op, undef, value) = (m.i32(78), m.undef(i32t), m.int_const(i64t, 1));
+            let _ = m.call(at, atomic, vec![atomic_op, h, or, undef, undef, undef, value]);
+            let u = m.uses();
+            let _ = m.write();
+            (u.atomic64_typed, u.atomic64_heap)
+        };
+        // On a path no lane takes: nothing.
+        assert_eq!(build(2 | 0x1000, HEAP, "dx.op.atomicBinOp.i64", false), (false, false));
+        // A raw buffer from the heap: the heap feature only.
+        assert_eq!(build(11 | 0x1000, HEAP, "dx.op.atomicBinOp.i64", true), (false, true));
+        // A typed texture from a binding: the typed feature only.
+        assert_eq!(build(2 | 0x1000, BINDING, "dx.op.atomicBinOp.i64", true), (true, false));
+        // A typed texture from the heap, compare-exchange: both.
+        assert_eq!(build(2 | 0x1000, HEAP, "dx.op.atomicCompareExchange.i64", true), (true, true));
     }
 
     #[test]
