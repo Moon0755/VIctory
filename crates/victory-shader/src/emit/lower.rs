@@ -7018,8 +7018,6 @@ impl<'a> Lower<'a> {
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
                 let x = self.mac_acc_bits(inst)?;
-                self.s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 let mut acc = self
                     .s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
