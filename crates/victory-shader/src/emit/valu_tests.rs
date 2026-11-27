@@ -2259,7 +2259,7 @@ fn movrels_outside_the_register_array_reads_v0() {
         vop1(0x043, 3, vgpr(5)), // v_movrels_b32 v3, v5: v3 = v[5 + m0]
         vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3
     ]);
-    run_cases(&shader, &[[0xCAFE_BABE, 300, 0, 0]], |backend, _, _, got| {
+    run_cases(&shader, &[[0xCAFE_BABE, 255, 0, 0]], |backend, _, _, got| {
         assert_eq!(got, 0xCAFE_BABE, "{backend}: an out-of-range source is v0");
     });
 }
