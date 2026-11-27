@@ -363,7 +363,7 @@ mod tests {
         // move taken to write only v2); with N = 6 the second reads v8-v9.
         for (n, second) in [
             (4, (8..16).chain([0, 1]).collect::<Vec<u8>>()),
-            (6, vec![8, 9, 0, 1]),
+            (6, vec![8, 9, 1]),
         ] {
             let p = build_words(&[
                 vop2(0x1B, 1, 131, 0), // v_and_b32 v1, 3, v0

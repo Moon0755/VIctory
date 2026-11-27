@@ -846,7 +846,10 @@ fn effects(
                     regs(s, &mut r)?;
                 }
             }
-            if src_indexed {
+            if src_indexed
+                && let Some(Operand::Vector { reg, .. }) = v.src.first()
+                && m0_max.is_none_or(|m| u16::from(*reg) + u16::from(m) > 255)
+            {
                 // An index outside the register array reads v0.
                 r.push((Reg::V(0), NONE));
             }
