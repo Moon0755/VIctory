@@ -406,7 +406,10 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &Dispatch {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![4, 4] }),
+                    ],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -414,6 +417,74 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// The immediate and SGPR offset of a scalar buffer load are truncated to
+/// dwords independently before they are added: 3 + 3 reads the dword at
+/// byte 0, where truncating only their sum reads byte 4 (RDNA2 SMEM,
+/// measured on gfx1030/gfx1036; Leonida `design.md` "Scalar/buffer memory").
+#[test]
+fn a_scalar_buffer_load_truncates_immediate_and_soffset_before_adding() {
+    let mut words = HEAP_CONSTANT_WAVE32.to_vec();
+    // Same program as HEAP_CONSTANT_WAVE32, with offset:3 and soffset s3 = 3.
+    assert_eq!(words[10], 0xF420_0504);
+    assert_eq!(words[11], 0xFA00_0008);
+    words.insert(10, 0xBE83_0383); // s_mov_b32 s3, 3
+    words[12] = 0x0600_0003; // s_buffer_load_dword s20, s[8:11], s3 offset:3
+    let shader = build(
+        &words,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let data: Vec<u32> = vec![7, 8, 9, 10];
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => 1,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![7; 32], "{label}: 3 + 3 reads the dword at 0");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

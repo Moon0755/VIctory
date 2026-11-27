@@ -4146,13 +4146,19 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
-        if let Some(x) = extra {
-            addr = self.s.m.bin(c, Bin::Add, addr, x);
+        let mask = self.s.m.i32(!3);
+        let mut addr = self.s.m.i32(*offset as u32 & !3);
+        if base != 0 || extra.is_some() {
+            let mut b = self.s.m.i32(base);
+            if let Some(x) = extra {
+                b = self.s.m.bin(c, Bin::Add, b, x);
+            }
+            let b = self.s.m.bin(c, Bin::And, b, mask);
+            addr = self.s.m.bin(c, Bin::Add, addr, b);
         }
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
+            let so = self.s.m.bin(c, Bin::And, so, mask);
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
@@ -4206,9 +4212,11 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
         let constant = match addr {
             V::Const(_)
-                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
+                if matches!(soffset, Operand::Scalar { code: NULL, .. })
+                    && base == 0
+                    && extra.is_none() =>
             {
-                Some(*offset as u32)
+                Some(*offset as u32 & !3)
             }
             _ => None,
         };
