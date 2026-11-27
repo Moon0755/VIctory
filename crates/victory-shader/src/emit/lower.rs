@@ -4915,6 +4915,22 @@ impl<'a> Lower<'a> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
+        // A typed element is all or nothing: one ending past the raw view's
+        // record count reads zero in every data channel, not the dwords of
+        // it that still fit (RDNA2, gfx1036). The count is the raw buffer's
+        // width in bytes.
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = self.s.m.undef(i32t);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let width = self.s.m.extract(c, d, 0);
+        let size = self.s.m.i32(total / 8);
+        let end = self.s.m.bin(c, Bin::Add, off, size);
+        let no_wrap = self.s.m.cmp(c, pred::IUGE, end, off);
+        let fits = self.s.m.cmp(c, pred::IULE, end, width);
+        let whole = self.s.m.bin(c, Bin::And, no_wrap, fits);
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
             let mask = l.s.m.i8((1u8 << n) - 1);
@@ -5042,6 +5058,8 @@ impl<'a> Lower<'a> {
                     float(self, f)
                 }
             };
+            let zero = self.s.m.i32(0);
+            let x = self.s.m.select(c, whole, x, zero);
             out.push(x);
         }
         let one = match numeric {
