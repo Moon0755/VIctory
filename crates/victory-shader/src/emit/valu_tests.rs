@@ -466,8 +466,16 @@ fn f16_to_f32(bits: u16) -> f32 {
 
 /// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
 const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+    mtbuf_at(op, vdata, srsrc, format, 0)
+}
+
+/// [`mtbuf`] at immediate byte offset `byte_off`.
+const fn mtbuf_at(op: u8, vdata: u8, srsrc: u8, format: u8, byte_off: u16) -> [u32; 2] {
     [
-        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
+        0x3A << 26
+            | (format as u32 & 0x7F) << 19
+            | (op as u32 & 7) << 16
+            | (byte_off as u32 & 0xFFF),
         0x80 << 24
             | (op as u32 >> 3 & 1) << 21
             | (srsrc as u32 >> 2 & 0x1F) << 16
@@ -533,6 +541,68 @@ fn normalized_buffer_formats_load_their_ends_exactly() {
                 "{backend}: format {format} of {stored:#x} = {got:#010x}, want {want}",
             );
         });
+    }
+}
+
+/// A typed element is all or nothing: one ending past the buffer's record
+/// count reads as zero, not as the dwords of it that still fit.
+#[test]
+fn typed_elements_ending_past_the_buffer_read_zero() {
+    // tbuffer_load_format_xy, 32_32_UINT: an 8-byte element.
+    let (xy, format) = (1, 62);
+    let (a, b) = (0x1111_1111, 0x2222_2222);
+    let shader_at = |byte_off| {
+        let mut body = buffer_store_dword(1, 8, 12).to_vec();
+        body.extend(buffer_store_dword(2, 8, 16));
+        body.push(0xBF8C_3F70); // s_waitcnt vmcnt(0)
+        body.extend(mtbuf_at(xy, 0, 8, format, byte_off));
+        body.push(0x4A00_0300); // v_add_nc_u32 v0, v0, v1
+        build_valu_cs(&body)
+    };
+    // A 20-byte view: the element at 12 ends exactly at its end, the one at
+    // 16 crosses it. The hardware reads the second as zero in both channels.
+    for (byte_off, want) in [(12, a + b), (16, 0)] {
+        let shader = shader_at(byte_off);
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let host = match Host::new(warp) {
+                Ok(host) => host,
+                Err(e) => {
+                    eprintln!("no SM 6.6 {label} device ({e}); skipped");
+                    continue;
+                }
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => [a, b, 0, 0][u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(5)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(
+                out[0][0], want,
+                "{label}: 32_32_UINT element at byte {byte_off} of a 20-byte view",
+            );
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
     }
 }
 
