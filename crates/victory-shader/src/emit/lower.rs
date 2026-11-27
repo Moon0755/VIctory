@@ -7078,7 +7078,8 @@ impl<'a> Lower<'a> {
                     // exact result up, not the f32 midpoint tie down.
                     let x = self.s.m.f32(0x3A38_A000); // f16 0x11c5
                     let boundary = self.s.m.cmp(c, pred::OEQ, a, x);
-                    let up = self.s.m.f32(0x3F80_1001);
+                    // f16 0x3c01, widened exactly.
+                    let up = self.s.m.f32(0x3F80_2000);
                     self.s.m.select(c, boundary, up, r)
                 }
                 _ => {
