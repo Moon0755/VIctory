@@ -362,7 +362,7 @@ mod tests {
         // second index, which then has no bound (it would, were the first
         // move taken to write only v2); with N = 6 the second reads v8-v9.
         for (n, second) in [
-            (4, (8..16).chain([1]).collect::<Vec<u8>>()),
+            (4, (8..16).chain([0, 1]).collect::<Vec<u8>>()),
             (6, vec![8, 9, 1]),
         ] {
             let p = build_words(&[

@@ -846,6 +846,14 @@ fn effects(
                     regs(s, &mut r)?;
                 }
             }
+            if src_indexed
+                && let Some(Operand::Vector { reg, .. }) = v.src.first()
+                && *reg != 0
+                && m0_max.is_none_or(|m| u16::from(*reg) + u16::from(m) >= vgprs)
+            {
+                // An out-of-range source VGPR reads v0 (RDNA2 ISA §3.6.1).
+                r.push((Reg::V(0), NONE));
+            }
             // GFX10 compares into EXEC write nothing else.
             if name.starts_with("v_cmpx") {
                 w.extend(mask(EXEC));
