@@ -4146,13 +4146,19 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
+        let signed_imm = *offset;
+        let imm = signed_imm as u32;
+        let offset = &(imm.wrapping_add(base) as i32);
         let mut addr = self.s.m.i32(*offset as u32);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
-        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            let so = self.operand(inst, soffset)?;
+        let so = if matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            None
+        } else {
+            Some(self.operand(inst, soffset)?)
+        };
+        if let Some(so) = so {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
@@ -4165,6 +4171,38 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A descriptor built in the shader limits every dword by its record
+        // count (times the stride when it has one). Compare the aligned sOFF
+        // against the room left after the aligned immediate; the subtraction
+        // is exact in 64 bits, so the sum cannot wrap.
+        let record_out: Vec<Option<V>> = match src {
+            // Bit 20 of the immediate does not follow the measured bound;
+            // keep that unmodelled case on the old path.
+            Source::Built { bits, words, .. } if signed_imm >= 0 => {
+                let stride = u64::from(*bits >> 16 & 0x3FFF).max(1);
+                let limit = u64::from(words[0]) * stride;
+                let bound_imm = u64::from(imm & !3);
+                (0..count)
+                    .map(|k| {
+                        let fixed = bound_imm + 4 * u64::from(k) + 4;
+                        if fixed > limit {
+                            return Some(self.s.m.bool(true));
+                        }
+                        so.and_then(|s| {
+                            let rest = limit - fixed;
+                            if rest >= u64::from(!3u32) {
+                                return None;
+                            }
+                            let not3 = self.s.m.i32(!3);
+                            let a = self.s.m.bin(c, Bin::And, s, not3);
+                            let rest = self.s.m.i32(rest as u32);
+                            Some(self.s.m.cmp(c, pred::IUGT, a, rest))
+                        })
+                    })
+                    .collect()
+            }
+            _ => vec![None; count as usize],
+        };
         // Constant data through the resource heap itself is a raw buffer: the
         // host's constant buffer views need 256-byte alignment, the title's
         // 16 (module notes, "Constant buffers in the heap").
@@ -4199,6 +4237,12 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = if let Some(out) = record_out[k as usize] {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.select(c, out, zero, x)
+                } else {
+                    x
+                };
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -4240,6 +4284,12 @@ impl<'a> Lower<'a> {
                     let a = self.s.m.bin(c, Bin::Add, addr, off);
                     self.cbuffer_dword(h, a)
                 }
+            };
+            let x = if let Some(out) = record_out[k as usize] {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(c, out, zero, x)
+            } else {
+                x
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
