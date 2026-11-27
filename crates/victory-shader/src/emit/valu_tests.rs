@@ -2249,6 +2249,21 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
     );
 }
 
+/// A relative source outside the 256-register array reads v0.
+#[test]
+fn movrels_outside_the_register_array_reads_v0() {
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(1)), // v_mov_b32 v0, v1
+        vop1(0x002, 12, vgpr(2)), // v_readfirstlane_b32 s12, v2
+        s_mov_b32(124, 12), // s_mov_b32 m0, s12
+        vop1(0x043, 3, vgpr(5)), // v_movrels_b32 v3, v5: v3 = v[5 + m0]
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3
+    ]);
+    run_cases(&shader, &[[0xCAFE_BABE, 300, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0xCAFE_BABE, "{backend}: an out-of-range source is v0");
+    });
+}
+
 #[test]
 fn v_mul_legacy_f32_treats_denormals_as_zero() {
     // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)

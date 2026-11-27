@@ -846,6 +846,10 @@ fn effects(
                     regs(s, &mut r)?;
                 }
             }
+            if src_indexed {
+                // An index outside the register array reads v0.
+                r.push((Reg::V(0), NONE));
+            }
             // GFX10 compares into EXEC write nothing else.
             if name.starts_with("v_cmpx") {
                 w.extend(mask(EXEC));

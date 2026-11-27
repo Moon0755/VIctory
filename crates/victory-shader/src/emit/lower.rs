@@ -6115,7 +6115,11 @@ impl<'a> Lower<'a> {
                 };
                 let indexed_src = name != "v_movreld_b32";
                 let value = if indexed_src {
-                    let mut r = self.s.m.i32(0);
+                    // An index outside the register array reads v0.
+                    let mut r = match inst.read(Reg::V(0)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    };
                     for k in 0..=255u8.saturating_sub(sreg) {
                         let Some(x) = inst.read(Reg::V(sreg + k)) else {
                             break;
