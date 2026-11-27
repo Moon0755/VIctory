@@ -9596,32 +9596,55 @@ impl<'a> Lower<'a> {
         if let (true, Some((width, _))) = (store, sub) {
             // The field of the dword holding it, by two atomics on that dword
             // (clear, then set): other lanes' fields in it are left alone.
-            // shortcut: the field is taken not to cross a dword.
             if index.is_some() {
                 return Err("a byte or half buffer store by index");
             }
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let at_base = self.s.m.bin(c, Bin::And, off, not3);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let field = self.s.m.i32(if width == 8 { 0xFF } else { 0xFFFF });
-            let x = self.s.m.bin(c, Bin::And, x, field);
-            let x = self.s.m.bin(c, Bin::Shl, x, sh);
+            let v = self.s.m.bin(c, Bin::And, x, field);
+            let x = self.s.m.bin(c, Bin::Shl, v, sh);
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
-            let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
-            for (op, v) in [(1, keep), (2, x)] {
-                let args = [h, self.s.m.i32(op), at, iu, iu, v];
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+            let write_field = |this: &mut Self, off: V, keep: V, val: V, active: Option<V>| -> Result<(), Why> {
+                let (h, at) = this.raw_view(site, src, off, 4, (11 | 0x1000, 0), true, active)?;
+                let begin = this.begin_guarded(active);
+                let c = this.cur;
+                for (op, w) in [(1, keep), (2, val)] {
+                    let args = [h, this.s.m.i32(op), at, iu, iu, w];
+                    this.s
+                        .op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+                }
+                this.mark_view_write(h, at, 4, None);
+                this.end_guarded(begin, &[]);
+                Ok(())
+            };
+            write_field(self, at_base, keep, x, guard)?;
+            if width == 16 {
+                // At byte 3 the high byte is byte 0 of the next dword, unless
+                // advancing by 4 wraps the 32-bit offset.
+                let c = self.cur;
+                let four = self.s.m.i32(4);
+                let next = self.s.m.bin(c, Bin::Add, at_base, four);
+                let no_wrap = self.s.m.cmp(c, pred::IUGT, next, at_base);
+                let is3 = self.s.m.cmp(c, pred::EQ, byte, three);
+                let straddles = self.s.m.bin(c, Bin::And, is3, no_wrap);
+                let straddles = match guard {
+                    Some(g) => self.s.m.bin(c, Bin::And, g, straddles),
+                    None => straddles,
+                };
+                let k8 = self.s.m.i32(8);
+                let hi = self.s.m.bin(c, Bin::LShr, v, k8);
+                let mask = self.s.m.i32(0xFF);
+                let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+                write_field(self, next, keep, hi, Some(straddles))?;
             }
-            self.mark_view_write(h, at, 4, None);
-            self.end_guarded(begin, &[]);
             return Ok(());
         }
         if store {
