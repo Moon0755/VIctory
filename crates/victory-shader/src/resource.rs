@@ -654,6 +654,21 @@ impl<'a> Tracer<'a> {
         ))
     }
 
+
+    /// The operands of `s_addk_i32` writing `v`: the destination's value on
+    /// entry and its sign-extended immediate.
+    fn addk(&self, v: Value) -> Option<[Term; 2]> {
+        let inst = self.def(v)?;
+        if inst.name() != "s_addk_i32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop { imm: Some(imm), .. } = &inst.fields else {
+            return None;
+        };
+        let imm = i32::from(*imm as i16) as u32;
+        Some([self.origin(inst.reads.first()?.1), Term::Const(imm)])
+    }
+
     fn sum(&self, t: Term) -> Sum {
         let v = match t {
             Term::Const(c) => {
@@ -694,6 +709,7 @@ impl<'a> Tracer<'a> {
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
+            .or_else(|| self.addk(v))
             .or_else(|| self.vadd(v))
         else {
             return dynamic;
