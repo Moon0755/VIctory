@@ -924,3 +924,202 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A root descriptor address plus a full 64-bit offset must keep the
+/// offset's high dword. The program adds s[2:3] = -0x100 to the root
+/// address in s[6:7] with `s_add_u32`/`s_addc_u32` and stores through the
+/// sum. Rebuilding the address from only the offset's low dword lands 4 GiB
+/// above the correct page; the two pages map to separate host copies.
+#[test]
+fn a_root_address_sum_keeps_a_real_high_half_addend() {
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    w.extend(s_load(0, 20, 0, 0)); // a title-memory load, enabling root memory
+    w.push(0x800C_0206); // s_add_u32 s12, s6, s2
+    w.push(0x820D_0307); // s_addc_u32 s13, s7, s3
+    w.push(v_mov_b32(1, ZERO));
+    w.push(v_mov_b32(2, SIXTY_FOUR));
+    w.extend(global(28, 0, 1, 2, 12, 0)); // global_store_dword v1, v2, s[12:13]
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(3, 20));
+    w.extend(buffer_store_dword(3, 8, 0));
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.memory && l.memory_writes);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+
+    // Level 1 entries for the correct address (block 1, heap index 1) and
+    // the address 4 GiB above it (block 2, heap index 3). Both use the same
+    // low-dword start, so the access is dword 0 in either copy.
+    let (low_view, high_view, null) = (1, 3, 5);
+    let correct_at = TITLE - 0x100;
+    let wrong_at = correct_at + 0x1_0000_0000;
+    let l1 = |a: u64| (((a >> 32) as u32) << 4 | (a as u32) >> 28) as usize;
+    let mut table = vec![0u32; 4096];
+    table[l1(correct_at)] = 1;
+    table[l1(wrong_at)] = 2;
+    for _ in 0..4 * 4096 {
+        table.extend([null, 0]);
+    }
+    let start = correct_at as u32;
+    let page = (start >> 16 & 0xFFF) as usize;
+    for (block, view) in [(1usize, low_view), (2, high_view)] {
+        let at = 4096 + 2 * (block * 4096 + page);
+        table[at..at + 2].copy_from_slice(&[view, start]);
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let correct = vec![0u32; 128];
+    let wrong = vec![0u32; 128];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        let constants = [
+            correct_at as u32,
+            (correct_at >> 32) as u32,
+            0xFFFF_FF00,
+            0xFFFF_FFFF,
+        ];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => constants[u.dword as usize],
+                RootType::Descriptor => (TITLE >> (32 * u.dword)) as u32,
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.clone(),
+                            },
+                        ),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(4),
+                        View::Memory(&correct),
+                        View::Pair,
+                        View::Memory(&wrong),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[1][0], 64, "{label}: the store at the correct address");
+        assert_eq!(out[2][0], 0, "{label}: no store 4 GiB higher");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
