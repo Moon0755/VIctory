@@ -6308,9 +6308,13 @@ impl<'a> Lower<'a> {
             }
             "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
+                // Denormals flush in and out of it in every float mode (measured
+                // on RDNA2 by the Leonida project).
                 let a = f(self, 0)?;
+                let a = self.ftz(a);
                 let one = self.s.m.f32(1.0f32.to_bits());
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
+                let r = self.ftz(r);
                 float(self, r)
             }
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
@@ -6330,10 +6334,26 @@ impl<'a> Lower<'a> {
                     "v_sin_f32" => 13,
                     _ => 12,
                 };
+                // v_rsq_f32, v_sqrt_f32, v_log_f32 and v_exp_f32 read a denormal
+                // input as a zero of its sign and flush a denormal result in
+                // every float mode, and an invalid input of the logarithm gives
+                // the negative quiet NaN (measured on RDNA2 by the Leonida
+                // project).
+                let flushes = matches!(op, 25 | 24 | 23 | 21);
+                let a = if flushes { self.ftz(a) } else { a };
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
                     _ => self.unary(op, a),
+                };
+                let r = if flushes { self.ftz(r) } else { r };
+                let r = if op == 23 {
+                    let zero = self.s.m.f32(0);
+                    let neg = self.s.m.cmp(c, pred::OLT, a, zero);
+                    let qnan = self.s.m.f32(0xFFC0_0000);
+                    self.s.m.select(c, neg, qnan, r)
+                } else {
+                    r
                 };
                 float(self, r)
             }
