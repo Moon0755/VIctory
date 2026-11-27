@@ -744,3 +744,145 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         }
     }
 }
+
+const fn smem_literal(sdst: u8, value: u32) -> [u32; 2] {
+    [0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | 0xFF, value]
+}
+
+/// SMEM `s_buffer_load_dword*` through `s[base:base+3]` with an SGPR offset.
+const fn smem_buffer_load_so(op: u32, sdata: u8, base: u8, offset: u32, so: u8) -> [u32; 2] {
+    [
+        0xF400_0000 | op << 18 | (sdata as u32) << 6 | (base as u32) >> 1,
+        (so as u32) << 25 | offset,
+    ]
+}
+
+/// SMEM `s_buffer_load_dword*` through `s[base:base+3]` with a null SGPR offset.
+const fn smem_buffer_load(op: u32, sdata: u8, base: u8, offset: u32) -> [u32; 2] {
+    smem_buffer_load_so(op, sdata, base, offset, 125)
+}
+
+/// Scalar buffer loads through a descriptor the program builds around a root
+/// SRV keep the descriptor's record limit: with stride 4 and NUM_RECORDS 2
+/// the limit is 8 bytes. A dwordx4 at offset 0 reads two data dwords and two
+/// zeros; a dynamic sOFF of 4 is still in range and 8 is out. The host view
+/// deliberately has four data dwords, so a lowering that ignores the
+/// descriptor words reads them instead.
+#[test]
+fn a_built_scalar_buffer_load_keeps_num_records_times_stride() {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0 (root SRV address, low)
+        0x8805_FF01,
+        0x0004_0000, // s_or_b32 s5, s1, stride 4 in V# dword 1
+    ];
+    words.extend(smem_literal(6, 2)); // NUM_RECORDS = 2 elements
+    words.extend(smem_literal(7, 0x1101_4FAC));
+    words.extend(smem_buffer_load(10, 12, 4, 0));
+    words.extend(smem_literal(10, 4));
+    words.extend(smem_buffer_load_so(8, 20, 4, 0, 10));
+    words.extend(smem_literal(10, 8));
+    words.extend(smem_buffer_load_so(8, 21, 4, 0, 10));
+    words.extend([
+        0xBE88_0302, // s_mov_b32 s8, s2 (the result UAV's table)
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xF408_0404,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[8:9], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_020C, // v_mov_b32 v1, s12
+        0x7E06_020D, // v_mov_b32 v3, s13
+        0x7E08_020E, // v_mov_b32 v4, s14
+        0x7E0A_020F, // v_mov_b32 v5, s15
+        0x7E0C_0214, // v_mov_b32 v6, s20
+        0x7E0E_0215, // v_mov_b32 v7, s21
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+        0xE070_1080,
+        0x8004_0302, // ... v3, ... offset:0x80
+        0xE070_1100,
+        0x8004_0402, // ... v4, ... offset:0x100
+        0xE070_1180,
+        0x8004_0502, // ... v5, ... offset:0x180
+        0xE070_1200,
+        0x8004_0602, // ... v6, ... offset:0x200
+        0xE070_1280,
+        0x8004_0702, // ... v7, ... offset:0x280
+        0xBF81_0000, // s_endpgm
+    ]);
+    let root = |root, sgprs, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let used = |kind, root, user_data, slot| UsedResource {
+        kind,
+        root,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data,
+        slot,
+    };
+    let shader = build(
+        &words,
+        vec![
+            root(RootType::Descriptor, 2, 0, 0),
+            root(RootType::Table, 1, 2, 1),
+        ],
+        vec![
+            used(ResourceType::Srv, RootType::Descriptor, 0, 0),
+            used(ResourceType::Uav, RootType::Table, 2, 1),
+        ],
+        32,
+    );
+    let data: Vec<u32> = vec![7, 8, 9, 10];
+    let views = [
+        View::RawUav(192),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root_sig, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        // The root descriptor's host stand-ins: view 1 at byte offset 0.
+        // The output UAV is the table at heap index 0.
+        (ud[0], ud[1], ud[2]) = (1, 0, 0);
+        let out = host
+            .dispatch(
+                &root_sig,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let mut want = vec![7; 32];
+        want.extend([8; 32]);
+        want.extend([0; 32]);
+        want.extend([0; 32]);
+        want.extend([8; 32]);
+        want.extend([0; 32]);
+        assert_eq!(out[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
