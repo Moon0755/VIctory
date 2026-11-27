@@ -483,6 +483,73 @@ fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
     build_valu_cs(&body)
 }
 
+/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 offen`.
+const fn mubuf_offen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | op << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+const VMEM_WAIT: u32 = 0xBF8C_3F70;
+
+#[test]
+fn short_store_at_byte_three_writes_both_dwords() {
+    // Store 0xa5be at byte 3, then read dword 0 back so the harness's final
+    // store leaves it unchanged; dword 1 is read back directly.
+    let mut body = mubuf_offen(0x1A, 1, 2, 8).to_vec(); // buffer_store_short v1, v2, s[8:11], 0 offen
+    body.push(VMEM_WAIT);
+    body.extend(mubuf_offen(0x0C, 0, 3, 8)); // buffer_load_dword v0, v3, s[8:11], 0 offen
+    let shader = build_valu_cs(&body);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => [0xA5BE, 3, 0, 0][u.dword as usize],
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][..2], [0xBE00_0000, 0xA5], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn short_store_at_u32_max_does_not_wrap_to_dword_zero() {
+    // A 16-bit store at offset u32::MAX (byte 3 of 0xFFFF_FFFC) is out of
+    // bounds; advancing to the second byte's dword must not wrap to dword 0.
+    let mut body = buffer_store_dword(1, 8, 0).to_vec();
+    body.push(VMEM_WAIT);
+    body.extend(mubuf_offen(0x1A, 3, 2, 8)); // buffer_store_short v3, v2, s[8:11], 0 offen
+    body.push(VMEM_WAIT);
+    body.extend(mubuf_offen(0x0C, 0, 4, 8)); // buffer_load_dword v0, v4, s[8:11], 0 offen
+    let shader = build_valu_cs(&body);
+    run_cases(&shader, &[[0x1122_3344, u32::MAX, 0xA5BE, 0]], |backend, _, _, got| {
+        assert_eq!(
+            got, 0x1122_3344,
+            "{backend}: wrapping u32::MAX must not corrupt dword 0"
+        );
+    });
+}
+
 #[test]
 fn tbuffer_d16_loads_pack_two_channels_per_dword() {
     // tbuffer_load_format_d16_x and tbuffer_load_format_d16_xy.
