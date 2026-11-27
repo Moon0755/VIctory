@@ -3896,4 +3896,49 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
     }
+
+    #[test]
+    fn a_real_high_half_addend_is_not_treated_as_carry() {
+        // s[12:13] = s[6:7] + s[2:3], a full 64-bit sum. The high half's
+        // nonzero addend s3 is not the low half's carry, so this address
+        // cannot be rebuilt as the root descriptor plus only s2.
+        let r = track_words(
+            &[
+                0x800C_0206, // s_add_u32 s12, s6, s2
+                0x820D_0307, // s_addc_u32 s13, s7, s3
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xDC70_8000,
+                0x000C_0101, // global_store_dword v1, v1, s[12:13]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 4), param(Descriptor, 6, 2)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1.param, MEMORY);
+    }
+
+    #[test]
+    fn only_a_zero_vector_addend_leaves_room_for_carry() {
+        let run = |zero| {
+            track_words(
+                &[
+                    0xD70F_6A00,
+                    0x0202_0406, // v_add_co_u32 v0, vcc_lo, s6, v2
+                    if zero {
+                        0x7E08_0280
+                    } else {
+                        0x7E08_0281
+                    }, // v_mov_b32 v4, 0/1
+                    0x5002_0807, // v_add_co_ci_u32 v1, vcc_lo, s7, v4, vcc_lo
+                    0xDC70_8000,
+                    0x007D_0100, // global_store_dword v[0:1], v1, off
+                    S_ENDPGM,
+                ],
+                &[param(Constants, 0, 4), param(Descriptor, 6, 2)],
+                HwStage::Cs,
+            )
+        };
+        assert_eq!(run(true).scalar[0].1.param, 1);
+        assert_eq!(run(false).scalar[0].1.param, MEMORY);
+    }
 }
