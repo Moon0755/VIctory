@@ -9596,7 +9596,6 @@ impl<'a> Lower<'a> {
         if let (true, Some((width, _))) = (store, sub) {
             // The field of the dword holding it, by two atomics on that dword
             // (clear, then set): other lanes' fields in it are left alone.
-            // shortcut: the field is taken not to cross a dword.
             if index.is_some() {
                 return Err("a byte or half buffer store by index");
             }
@@ -9607,8 +9606,8 @@ impl<'a> Lower<'a> {
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let field = self.s.m.i32(if width == 8 { 0xFF } else { 0xFFFF });
-            let x = self.s.m.bin(c, Bin::And, x, field);
-            let x = self.s.m.bin(c, Bin::Shl, x, sh);
+            let v = self.s.m.bin(c, Bin::And, x, field);
+            let x = self.s.m.bin(c, Bin::Shl, v, sh);
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
@@ -9622,6 +9621,32 @@ impl<'a> Lower<'a> {
             }
             self.mark_view_write(h, at, 4, None);
             self.end_guarded(begin, &[]);
+            if width == 16 {
+                // At byte 3 the high byte is byte 0 of the next dword.
+                let straddles = self.s.m.cmp(c, pred::EQ, byte, three);
+                let straddles = match guard {
+                    Some(g) => self.s.m.bin(c, Bin::And, g, straddles),
+                    None => straddles,
+                };
+                let four = self.s.m.i32(4);
+                let next = self.s.m.bin(c, Bin::And, off, not3);
+                let next = self.s.m.bin(c, Bin::Add, next, four);
+                let (h, at) = self.raw_view(
+                    site, src, next, 4, (11 | 0x1000, 0), true, Some(straddles)
+                )?;
+                let begin = self.begin_guarded(Some(straddles));
+                let k8 = self.s.m.i32(8);
+                let x = self.s.m.bin(c, Bin::LShr, v, k8);
+                let mask = self.s.m.i32(0xFF);
+                let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+                for (op, v) in [(1, keep), (2, x)] {
+                    let args = [h, self.s.m.i32(op), at, iu, iu, v];
+                    self.s
+                        .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+                }
+                self.mark_view_write(h, at, 4, None);
+                self.end_guarded(begin, &[]);
+            }
             return Ok(());
         }
         if store {
@@ -9774,6 +9799,25 @@ impl<'a> Lower<'a> {
                 .s
                 .m
                 .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+            let x = if width == 16 {
+                // The access's own end is inside the view: a half at its last
+                // byte is out of bounds even though its first byte is not.
+                let i32t = self.s.t.i32;
+                let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                let z = self.s.m.i32(0);
+                let d = self
+                    .s
+                    .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, iu]);
+                let size = self.s.m.extract(c, d, 0);
+                let one = self.s.m.i32(1);
+                let end = self.s.m.bin(c, Bin::Add, off, one);
+                let no_wrap = self.s.m.cmp(c, pred::IUGE, end, off);
+                let before = self.s.m.cmp(c, pred::IULT, end, size);
+                let inside = self.s.m.bin(c, Bin::And, no_wrap, before);
+                self.s.m.select(c, inside, x, z)
+            } else {
+                x
+            };
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
