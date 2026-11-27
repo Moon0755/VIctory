@@ -2281,3 +2281,36 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+
+#[test]
+fn transcendental_invalid_results_are_negative_qnan() {
+    // Measured on RDNA2 (gfx1030) by the Leonida project: an invalid result of
+    // v_sqrt_f32, v_rsq_f32 or v_log_f32 is the negative quiet NaN 0xffc00000.
+    // Hosts give it for the exact square root instructions, but their log2 of
+    // a negative is the all-ones NaN 0xffffffff.
+    let f = f32::to_bits;
+    let qnan = 0xFFC0_0000u32;
+    type OpCases = (u16, &'static str, Vec<(u32, u32)>);
+    let ops: [OpCases; 3] = [
+        (0x033, "v_sqrt_f32", vec![(f(-1.0), qnan), (f(-4.0), qnan)]),
+        (0x02E, "v_rsq_f32", vec![(f(-1.0), qnan)]),
+        (
+            0x027,
+            "v_log_f32",
+            vec![(f(-1.0), qnan), (f(-1000.0), qnan), (f(f32::NEG_INFINITY), qnan)],
+        ),
+    ];
+    for (op, name, cases) in ops {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0],
+            );
+        });
+    }
+}
