@@ -70,8 +70,7 @@ impl StaticSampler {
         let (min_lod, max_lod) = if mip == 0 {
             (0.0, 0.0)
         } else {
-            let min = lod(bits(w[1], 0, 12));
-            (min, lod(bits(w[1], 12, 12)).max(min))
+            (lod(bits(w[1], 0, 12)), lod(bits(w[1], 12, 12)))
         };
         StaticSampler {
             filter,

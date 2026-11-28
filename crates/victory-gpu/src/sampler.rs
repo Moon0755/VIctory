@@ -56,10 +56,10 @@ impl Fields {
         // Without a mip filter the console ignores the sampler's LOD fields
         // and samples the base level. With one, its minimum wins an inverted
         // range; D3D12's order would choose the maximum instead.
-        let (min_lod, max_lod) = if self.mip == 0 {
-            (0.0, 0.0)
+        let max_lod = if self.mip == 0 {
+            min_lod
         } else {
-            (min_lod, finite_lod(self.max_lod, min_lod).max(min_lod))
+            finite_lod(self.max_lod, min_lod).max(min_lod)
         };
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
