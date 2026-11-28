@@ -6834,8 +6834,9 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
-    /// An f16 source as an f32 (exact), with its abs/neg modifiers.
-    fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    /// An f16 source's bits and its f32 value (exact), with abs/neg modifiers
+    /// on the float.
+    fn half_fsrc_bits(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -6851,7 +6852,12 @@ impl<'a> Lower<'a> {
             let z = self.s.m.f32(0x8000_0000);
             f = self.s.m.bin(self.cur, Bin::Sub, z, f);
         }
-        Ok(f)
+        Ok((h, f))
+    }
+
+    /// An f16 source as an f32 (exact), with its abs/neg modifiers.
+    fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.half_fsrc_bits(inst, k).map(|(_, f)| f)
     }
 
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
@@ -7051,6 +7057,31 @@ impl<'a> Lower<'a> {
             return float_result(self, r);
         }
         if float1.contains(&name) {
+            let trans = matches!(
+                name,
+                "v_rcp_f16"
+                    | "v_sqrt_f16"
+                    | "v_rsq_f16"
+                    | "v_log_f16"
+                    | "v_exp_f16"
+                    | "v_sin_f16"
+                    | "v_cos_f16"
+            );
+            let trans_src = if trans {
+                let (h, a) = self.half_fsrc_bits(inst, 0)?;
+                let mut nan = h;
+                if v.abs & 1 != 0 {
+                    let mask = self.s.m.i32(0x7FFF);
+                    nan = self.s.m.bin(c, Bin::And, nan, mask);
+                }
+                if v.neg & 1 != 0 {
+                    let sign = self.s.m.i32(0x8000);
+                    nan = self.s.m.bin(c, Bin::Xor, nan, sign);
+                }
+                Some((nan, a))
+            } else {
+                None
+            };
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
                     let mut x = self.half_src(inst, 0)?;
@@ -7065,12 +7096,20 @@ impl<'a> Lower<'a> {
                     self.s.m.cast(c, op, x, f32t)
                 }
                 "v_rcp_f16" => {
-                    let a = self.half_fsrc(inst, 0)?;
+                    let a = if let Some((_, a)) = trans_src {
+                        a
+                    } else {
+                        self.half_fsrc(inst, 0)?
+                    };
                     let one = self.s.m.f32(1.0f32.to_bits());
                     self.s.m.bin(c, Bin::SDiv, one, a)
                 }
                 _ => {
-                    let a = self.half_fsrc(inst, 0)?;
+                    let a = if let Some((_, a)) = trans_src {
+                        a
+                    } else {
+                        self.half_fsrc(inst, 0)?
+                    };
                     let op = match name {
                         "v_sqrt_f16" => 24,
                         "v_rsq_f16" => 25,
@@ -7092,6 +7131,25 @@ impl<'a> Lower<'a> {
                     }
                 }
             };
+            if let Some((nan, _)) = trans_src {
+                if v.omod != 0 {
+                    return Err("an output modifier on a 16-bit operation");
+                }
+                let mut f = r;
+                if v.clamp {
+                    f = self.unary(7, f);
+                }
+                let h = self.narrow16(f);
+                if v.clamp {
+                    return self.write_half(inst, h, guard);
+                }
+                let mask = self.s.m.i32(0x7FFF);
+                let magnitude = self.s.m.bin(c, Bin::And, nan, mask);
+                let inf = self.s.m.i32(0x7C00);
+                let is_nan = self.s.m.cmp(c, pred::IUGT, magnitude, inf);
+                let h = self.s.m.select(c, is_nan, nan, h);
+                return self.write_half(inst, h, guard);
+            }
             return float_result(self, r);
         }
         if matches!(name, "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16") {
