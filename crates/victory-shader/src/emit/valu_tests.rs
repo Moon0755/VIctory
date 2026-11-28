@@ -1445,6 +1445,32 @@ fn v_sin_and_v_cos_f16_reduce_large_turns() {
     });
 }
 
+#[test]
+fn f16_transcendentals_preserve_nan_bits() {
+    let cases = [0x7C01u16, 0xFC35, 0x7E42, 0xFE7F];
+    for (op, name) in [
+        (0x54u16, "v_rcp_f16"),
+        (0x55, "v_sqrt_f16"),
+        (0x56, "v_rsq_f16"),
+        (0x57, "v_log_f16"),
+        (0x58, "v_exp_f16"),
+        (0x60, "v_sin_f16"),
+        (0x61, "v_cos_f16"),
+    ] {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [u32::from(x), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i];
+            assert_eq!(
+                got as u16, want,
+                "{backend}: {name}({:#06x}) = {:#06x}, want {want:#06x}",
+                inp[0] as u16,
+                got as u16,
+            );
+        });
+    }
+}
+
 /// A 32-bit literal in a signed 64-bit operand is sign-extended (an
 /// unsigned one's is zero-extended): -100 compared with `v[1:2]`, and
 /// shifted by `s_ashr_i64`.
