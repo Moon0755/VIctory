@@ -2466,9 +2466,11 @@ impl<'a> Lower<'a> {
     /// first rounds it away. A zero passes unreduced (the sine of -0 is -0).
     /// The sine of a half turn and the cosine of a quarter turn are exactly
     /// +0 on the hardware, where the host's function of the rounded angle
-    /// gives about 1e-7. Infinities and NaN give NaN.
-    /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// gives about 1e-7. Infinities and NaN give NaN. Up to 2^-12 turns the
+    /// hardware scales by a slightly smaller constant than rounded 2π. Very
+    /// small sines can use the scaled angle directly: their exact sine rounds
+    /// back to that angle, which keeps the bit test independent of the host's
+    /// approximate sine.
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -2476,9 +2478,21 @@ impl<'a> Lower<'a> {
         let part = self.s.m.bin(c, Bin::Sub, x, whole);
         let is_zero = self.s.m.cmp(c, pred::OEQ, x, zero);
         let part = self.s.m.select(c, is_zero, x, part);
-        let k = self.s.m.f32(TWO_PI.to_bits());
+        let x_size = self.unary(6, x);
+        let hardware_limit = self.s.m.f32(0x3980_0000);
+        let small = self.s.m.cmp(c, pred::OLE, x_size, hardware_limit);
+        let standard = self.s.m.f32(TWO_PI.to_bits());
+        let hardware = self.s.m.f32(0x40C9_0FD5);
+        let k = self.s.m.select(c, small, hardware, standard);
         let angle = self.s.m.bin(c, Bin::Mul, part, k);
         let r = self.unary(if cosine { 12 } else { 13 }, angle);
+        let r = if cosine {
+            r
+        } else {
+            let tiny_limit = self.s.m.f32(0x3780_0000);
+            let tiny = self.s.m.cmp(c, pred::OLE, x_size, tiny_limit);
+            self.s.m.select(c, tiny, angle, r)
+        };
         let at = if cosine { 0.25f32 } else { 0.5 };
         let at = self.s.m.f32(at.to_bits());
         let size = self.unary(6, part);
