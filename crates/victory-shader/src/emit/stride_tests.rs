@@ -166,12 +166,12 @@ fn entry(kind: ResourceType, dwords: u8, user_data: u8) -> UsedResource {
     }
 }
 
-fn build(
+fn lowered_program(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
     threads: u32,
-) -> HostShader {
+) -> Result<lower::Lowered, crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -186,9 +186,9 @@ fn build(
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -200,7 +200,15 @@ fn build(
         mesh_stride: 0,
         view_marks: false,
     })
-    .expect("lower");
+}
+
+fn build(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+) -> HostShader {
+    let lowered = lowered_program(words, layout, used, threads).expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -743,4 +751,35 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
             assert_eq!(words[0], want, "{label} {format:?}");
         }
     }
+}
+
+/// A phi of immediate samplers whose FORCE_UNNORMALIZED bits differ cannot
+/// pick one coordinate interpretation for the instruction using it.
+#[test]
+fn mixed_force_unnormalized_sampler_phi_is_refused() {
+    let mut words = CHOSEN_SAMPLER_WAVE32.to_vec();
+    let at = words
+        .iter()
+        .position(|&w| w == 0x0000_0092)
+        .expect("the clamping sampler's first word");
+    words[at] = 0x0000_8092;
+    let Err(err) = lowered_program(
+        &words,
+        vec![
+            param(RootType::Table, 0),
+            param(RootType::Constants, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![
+            entry(ResourceType::Srv, 8, 0),
+            entry(ResourceType::Uav, 4, 2),
+        ],
+        1,
+    ) else {
+        panic!("mixed texel-coordinate modes must be refused");
+    };
+    assert!(
+        err.to_string().contains("unnormalized"),
+        "unexpected error: {err}"
+    );
 }

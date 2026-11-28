@@ -1027,3 +1027,150 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+fn v_mov_literal(v: u8, bits: u32) -> [u32; 2] {
+    [0x7E00_0000 | (v as u32) << 17 | 1 << 9 | 255, bits]
+}
+
+fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// Texture at entry 0, a dummy record at entry 1, a raw UAV at entry 2,
+/// and an immediate point sampler in s[8:11].
+fn unnormalized_sample_prefix(sampler0: u32) -> Vec<u32> {
+    vec![
+        0xBE84_0300,
+        0xBE85_0380, // s[4:5] = s0: the table
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0502,
+        0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBE88_03FF,
+        sampler0, // s_mov_b32 s8, sampler0
+        0xBE89_03FF,
+        0x0100_0000, // s9: maximum LOD 16
+        0xBE8A_03FF,
+        0x0400_0000, // s10: point mip filter
+        0xBE8B_0380, // s11 = 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]
+}
+
+/// One-texel explicit gradients at texel coordinates: mip 0 unclamped and
+/// mip 2 with the clamp. Unscaled gradients span level 0 and pick mip 4.
+fn unnormalized_gradient_program() -> Vec<u32> {
+    let mut w = unnormalized_sample_prefix(0x0092); // clamp, no FORCE_UNNORMALIZED
+    for (v, x) in [
+        (0, 1.0f32),
+        (1, 0.0),
+        (2, 0.0),
+        (3, 1.0), // ddx, ddy in texels
+        (4, 8.0),
+        (5, 8.0), // texel coordinates
+        (6, 2.0), // LOD clamp
+    ] {
+        w.extend(v_mov_literal(v, x.to_bits()));
+    }
+    w.extend([
+        0xF088_1F08,
+        0x0043_0800, // image_sample_d v[8:11], v[0:5], ... unorm
+        0xF08C_1F08,
+        0x0043_0C00, // image_sample_d_cl v[12:15], v[0:6], ... unorm
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    ]);
+    w.extend(buffer_store_dword(8, 40, 0));
+    w.extend(buffer_store_dword(12, 40, 4));
+    w.push(0xBF81_0000);
+    w
+}
+
+/// No instruction unorm bit, but FORCE_UNNORMALIZED in the immediate sampler:
+/// (5.5, 9.5) hits texel (5, 9), not the clamped corner (15, 15).
+fn force_unnormalized_sample_program() -> Vec<u32> {
+    let mut w = unnormalized_sample_prefix(0x8092); // clamp + FORCE_UNNORMALIZED
+    for (v, x) in [(0, 5.5f32), (1, 9.5f32)] {
+        w.extend(v_mov_literal(v, x.to_bits()));
+    }
+    w.extend([
+        0xF080_0F08,
+        0x0043_0800, // image_sample v[8:11], v[0:1], ...
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    ]);
+    w.extend(buffer_store_dword(8, 40, 0));
+    w.push(0xBF81_0000);
+    w
+}
+
+fn run_unnormalized_shader(shader: &HostShader, view: View<'_>, want: &[f32], label: &str) {
+    let dummy = [0u32; 4];
+    let views = [
+        view,
+        View::Buffer {
+            data: &dummy,
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(4),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (adapter, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{adapter}: {label}: {e}"));
+        ran += 1;
+        let got: Vec<f32> = out[0][..want.len()]
+            .iter()
+            .map(|&x| f32::from_bits(x))
+            .collect();
+        assert_eq!(got, want, "{adapter}: {label}");
+    }
+    assert!(ran > 0, "no device");
+}
+
+#[test]
+fn unnormalized_explicit_gradients_select_their_mips() {
+    let shader = build(&unnormalized_gradient_program()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    run_unnormalized_shader(
+        &shader,
+        View::Levels(16, 5),
+        &[0.0, 2.0],
+        "explicit gradients",
+    );
+}
+
+#[test]
+fn sampler_force_unnormalized_makes_texel_coordinates() {
+    let shader = build(&force_unnormalized_sample_program()).expect("lower");
+    let texels: Vec<[f32; 4]> = (0..256).map(|i| [(i + 1) as f32, 0.0, 0.0, 1.0]).collect();
+    // Implicit derivatives in compute are refused by the old validator but run on the host.
+    run_unnormalized_shader(
+        &shader,
+        View::Texture(16, 16, &texels),
+        &[150.0],
+        "FORCE_UNNORMALIZED",
+    );
+}

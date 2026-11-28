@@ -24,6 +24,31 @@ mod bvh;
 
 type Why = &'static str;
 
+/// Whether an immediate sampler forces texel coordinates (SQ_IMG_SAMP_WORD0
+/// bit 15). Two immediate samplers chosen by control flow must agree: one
+/// converted coordinate cannot serve both interpretations.
+fn force_unnormalized(src: &Source) -> Result<Option<bool>, Why> {
+    let bit = |words: &[u32]| words.first().map(|w| w & 0x8000 != 0);
+    match src {
+        Source::Constant(words) => Ok(bit(words)),
+        Source::Phi { args, .. }
+            if matches!(args[..], [Source::Constant(_), Source::Constant(_)]) =>
+        {
+            let [Source::Constant(a), Source::Constant(b)] = &args[..] else {
+                unreachable!()
+            };
+            match (bit(a), bit(b)) {
+                (Some(a), Some(b)) if a == b => Ok(Some(a)),
+                (Some(_), Some(_)) => {
+                    Err("immediate samplers with different unnormalized-coordinate modes")
+                }
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -8697,8 +8722,9 @@ impl<'a> Lower<'a> {
                 .get(&(site, true))
                 .copied()
                 .ok_or("an untracked sampler")?;
+            let unnormalized = *unorm || force_unnormalized(ss)?.unwrap_or(false);
             if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
-                if *a16 || *d16 || *unorm || kind != 2 {
+                if *a16 || *d16 || unnormalized || kind != 2 {
                     return Err(
                         "a gather at a level of 16-bit values, texel coordinates or not 2D",
                     );
@@ -8749,13 +8775,14 @@ impl<'a> Lower<'a> {
                 *slot = to_float(self, x);
             }
             if kind == 5 {
-                if *unorm || op == 81 {
+                if unnormalized || op == 81 {
                     return Err("a cube sample with texel coordinates or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
             }
-            if *unorm {
+            let mut level0 = Vec::new();
+            if unnormalized {
                 // Texel coordinates: divided by the size of level 0.
                 let i32t = self.s.t.i32;
                 let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -8767,6 +8794,7 @@ impl<'a> Lower<'a> {
                     let n = self.s.m.extract(c, d, k as u32);
                     let n = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
+                    level0.push(n);
                 }
             }
             if op == 81 {
@@ -8905,6 +8933,14 @@ impl<'a> Lower<'a> {
                         g[k] = to_float(self, x);
                         let y = addr_val(self, first + spatial + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if unnormalized {
+                        // The console's gradients are in texels like its
+                        // coordinates; DXIL's are normalized.
+                        for k in 0..spatial {
+                            g[k] = self.s.m.bin(c, Bin::SDiv, g[k], level0[k]);
+                            g[3 + k] = self.s.m.bin(c, Bin::SDiv, g[3 + k], level0[k]);
+                        }
                     }
                     args.extend(&os);
                     args.extend(g);
