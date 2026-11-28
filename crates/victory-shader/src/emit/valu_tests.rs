@@ -1236,6 +1236,29 @@ fn v_sin_and_v_cos_f32_reduce_large_turns() {
 }
 
 #[test]
+fn v_sin_f32_uses_the_hardware_constant_for_a_small_turn() {
+    // Measured on RDNA2: up to 2^-12 turns the angle is scaled by
+    // 0x40c90fd5, not by the rounded 2*pi. At 2^-24 turns the product is an
+    // exponent shift of that constant and the exact sine rounds back to the
+    // product, so this checks the hardware constant rather than the host's
+    // approximate Sin.
+    let shader = build_valu_cs(&[vop1(0x035, 0, vgpr(1))]);
+    let cases: &[(u32, u32)] = &[
+        (0x3380_0000, 0x34C9_0FD5),  // +2^-24 turns
+        (0xB380_0000, 0xB4C9_0FD5),  // -2^-24 turns
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_sin_f32({:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+}
+
+#[test]
 fn v_cvt_u16_and_i16_f16_saturate() {
     // v_mov_b32 v0, 0; v_cvt_u16_f16 / v_cvt_i16_f16 v0, v1 (VOP1 0x052 / 0x053).
     let cases: &[(u16, u16, u16)] = &[
